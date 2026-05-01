@@ -26,14 +26,16 @@ class RegimeSignal:
 
 @dataclass(frozen=True)
 class FittedRegime:
-    """Spike-phase placeholder for the parameters returned by
-    fit_walk_forward. Carries the slice of observations that survived the
-    causal cutoff so predict_filtered can reproduce a deterministic signal
-    without re-slicing the panel. Production replacement will hold HMM
-    transition / emission parameters instead of raw observations."""
+    """Parameters returned by fit_walk_forward. Carries the causal-sliced
+    observations so predict_filtered can run the forward algorithm without
+    re-slicing the panel. `model` and `label_map` are populated by Gaussian
+    HMM fitters (regime/walk_forward.py) and left None by the spike
+    MinimalHMMFilter."""
     as_of: datetime
     observation_timestamps: tuple[datetime, ...]
     observations: tuple[float, ...]
+    model: object | None = None
+    label_map: tuple[int, ...] | None = None
 
 
 class RegimeClassifier(ABC):
