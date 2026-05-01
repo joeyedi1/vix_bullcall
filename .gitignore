@@ -1,0 +1,32 @@
+# Data — vintage-tagged raw pulls and processed panels are large and reproducible.
+# NEVER commit. ARCHITECTURE §6.3 treats these as an out-of-band immutable archive.
+# Anchored to repo root so it does NOT shadow src/vix_spread/data/ (the package).
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tooling sandbox
+.claude/
