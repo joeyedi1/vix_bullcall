@@ -16,3 +16,4 @@ class TheoreticalPrice:
     iv_used: float
     T_minutes: float
     is_executable: bool = False  # SENTINEL — fill engine rejects on this
+    rho: float = 0.0             # Black-76 ∂C/∂r; defaulted for back-compat
