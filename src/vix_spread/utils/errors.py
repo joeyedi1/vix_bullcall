@@ -24,3 +24,11 @@ class ExpiryError(Exception):
     """Raised when an option pricing call is made at or after the option's
     settlement event. Black-76 with T<=0 is undefined; this is a loud
     refusal rather than NaN propagation through the Greeks."""
+
+
+class FlatVolError(ValueError):
+    """Raised when both legs of a non-zero-width spread receive the same
+    implied vol. The validation memo flagged this as the signature of
+    VVIX (a flat-vol index) being substituted for strike-specific IVs —
+    pricing a vertical with σ_long == σ_short loses the skew information
+    the spread depends on."""

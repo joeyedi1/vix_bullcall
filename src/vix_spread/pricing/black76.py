@@ -35,8 +35,9 @@ from scipy.stats import norm
 
 from vix_spread.products.base import Product
 from vix_spread.products.spread import BullCallSpread
+from vix_spread.utils.errors import FlatVolError
 
-from .theoretical import TheoreticalPrice
+from .theoretical import TheoreticalPrice, TheoreticalSpreadPrice
 from .time_to_expiry import minutes_to_settlement
 
 if TYPE_CHECKING:
@@ -129,8 +130,40 @@ class Black76Pricer:
         iv_short: float,
         as_of: datetime,
         risk_free_rate: float,
-    ) -> 'TheoreticalSpreadPrice':
-        """Strike-specific IV per leg is REQUIRED. Raises FlatVolError if
-        iv_long == iv_short on a non-zero-width spread (validation-memo
-        VVIX-as-leg-IV defect)."""
-        ...
+    ) -> TheoreticalSpreadPrice:
+        """Strike-specific IV per leg is REQUIRED.
+
+        Raises FlatVolError if `iv_long == iv_short` — the validation-memo
+        defect signature of substituting VVIX (a flat-vol index) for the
+        strike-specific IVs the spread depends on. Bull call spreads have
+        non-zero width by `BullCallSpread.__post_init__` (long.strike <
+        short.strike), so the flat-vol check applies unconditionally.
+
+        Returns TheoreticalSpreadPrice with `value = long − short` (net
+        debit), per-leg breakdown, and aggregated Greeks. is_executable
+        is False — the FillEngine never accepts these as fills."""
+        if iv_long == iv_short:
+            raise FlatVolError(
+                f"iv_long ({iv_long}) == iv_short ({iv_short}) on a "
+                f"non-zero-width spread (strikes "
+                f"{spread.long_leg.strike} → {spread.short_leg.strike}). "
+                f"Pass strike-specific IVs from the chain — never a "
+                f"flat-surface index like VVIX."
+            )
+        long_price = self.price(
+            spread.long_leg, forward, iv_long, as_of, risk_free_rate,
+        )
+        short_price = self.price(
+            spread.short_leg, forward, iv_short, as_of, risk_free_rate,
+        )
+        return TheoreticalSpreadPrice(
+            value=long_price.value - short_price.value,
+            long_leg=long_price,
+            short_leg=short_price,
+            delta=long_price.delta - short_price.delta,
+            gamma=long_price.gamma - short_price.gamma,
+            vega=long_price.vega - short_price.vega,
+            theta=long_price.theta - short_price.theta,
+            rho=long_price.rho - short_price.rho,
+            is_executable=False,
+        )

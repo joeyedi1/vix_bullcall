@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
 from vix_spread.products.spread import BullCallSpread
 from vix_spread.products.vix_index_option import VIXIndexOption
+from vix_spread.products.vx_future import VXFuture
 from vix_spread.products.vx_future_option import VXFutureOption
 
 
@@ -13,6 +14,7 @@ def test_mixing_product_types_raises_type_error():
     the type system, not a code-review convention, blocks the mistake."""
     expiry = datetime(2026, 6, 17, tzinfo=timezone.utc)
     settlement = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
+    deliverable = VXFuture(contract_root="VX", settlement_date=date(2026, 6, 17))
 
     vix_idx_leg = VIXIndexOption(
         contract_root="VIX",
@@ -27,7 +29,7 @@ def test_mixing_product_types_raises_type_error():
         settlement_event=settlement,
         strike=22.0,
         right="call",
-        deliverable_vx=None,
+        deliverable_vx=deliverable,
     )
 
     with pytest.raises(TypeError):

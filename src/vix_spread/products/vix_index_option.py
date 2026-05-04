@@ -16,10 +16,22 @@ class VIXIndexOption(Product):
         return 100.0
 
     def settlement_value(self, market: 'SettlementMarket') -> float:
-        """Payoff = max(VRO − K, 0) × 100 for calls. VRO is the actual SOQ print
-        for this expiry — NOT spot VIX close, NOT Tuesday VX future close,
-        NOT theoretical Black-76 value."""
-        ...
+        """Cash payoff = max(VRO − K, 0) × 100 for calls,
+                        max(K − VRO, 0) × 100 for puts.
+
+        VRO is the actual SOQ print for this expiry — NOT spot VIX close,
+        NOT Tuesday VX future close, NOT theoretical Black-76 value
+        (validation-memo §12.7)."""
+        vro = market.vro_for(self.expiry)
+        if self.right == 'call':
+            intrinsic = max(vro - self.strike, 0.0)
+        elif self.right == 'put':
+            intrinsic = max(self.strike - vro, 0.0)
+        else:
+            raise ValueError(
+                f"Unknown right: {self.right!r} (expected 'call' or 'put')."
+            )
+        return intrinsic * self.option_multiplier()
 
     def hedge_ratio_to_vx(self, delta_b76: float) -> float:
         """option dollar delta = 100 × Δ_B76; VX multiplier = 1000.
