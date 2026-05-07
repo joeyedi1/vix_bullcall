@@ -91,6 +91,7 @@ class DataProcessor:
     SOURCE = "blpapi"
     OHLCV_PRODUCT = "vx_futures_ohlcv"
     QUOTES_PRODUCT = "vx_futures_quotes"
+    VIX_INDEX_OPTIONS_QUOTES_PRODUCT = "vix_index_options_quotes"
     GRID_FREQ = "1min"
     GRID_FREQ_SECONDS = 60
 
@@ -119,17 +120,32 @@ class DataProcessor:
         return self._load_shards(self.QUOTES_PRODUCT, vintage)
 
     def _load_shards(self, product: str, vintage: str | None) -> dict[str, pd.DataFrame]:
+        """Load all per-contract parquets for `product` at `vintage`.
+
+        Recovers the original Bloomberg ticker from the in-data `ticker`
+        column (set at ingestion time by the IntradayTickRequest /
+        IntradayBarRequest handlers). Falls back to filename-based recovery
+        only for legacy shards that lack the column. The in-data column is
+        authoritative for VIX option tickers, whose `safe_shard_key` form
+        (e.g. `'VIX_US_05_19_26_C20_Index'`) is not invertible by simple
+        underscore-substitution.
+        """
         if vintage is None:
             vintage = self.latest_vintage(product)
         d = self.raw_root / self.SOURCE / product
         out: dict[str, pd.DataFrame] = {}
         for f in sorted(d.glob(f"*_{vintage}.parquet")):
-            ticker_safe = f.stem.removesuffix(f"_{vintage}")
-            # Reverse the BaseDataFetcher safe-shard transformation: the
-            # ticker had its single space replaced with underscore, so
-            # restore the FIRST underscore.
-            ticker = ticker_safe.replace("_", " ", 1)
-            out[ticker] = pd.read_parquet(f)
+            df = pd.read_parquet(f)
+            if "ticker" in df.columns and len(df):
+                ticker = str(df["ticker"].iloc[0])
+            else:
+                # Legacy fallback: works only for tickers with a single space
+                # (VX futures: 'UXV25 Index'). Will produce the wrong ticker
+                # for multi-token symbols (VIX options) — but those shards
+                # always carry the column, so this branch isn't reached.
+                ticker_safe = f.stem.removesuffix(f"_{vintage}")
+                ticker = ticker_safe.replace("_", " ", 1)
+            out[ticker] = df
         return out
 
     # ---------------------------------------------------------------- #
@@ -275,6 +291,95 @@ class DataProcessor:
         return ages
 
     # ---------------------------------------------------------------- #
+    # OptionQuote-shaped alignment                                     #
+    #                                                                  #
+    # Distinct from `align_quotes` (futures BBO without sizes): pivots #
+    # BID/ASK ticks to per-minute (price + size) tuples, derives       #
+    # is_locked / is_crossed flags here (Bloomberg doesn't expose them #
+    # on the wire), and emits a schema that maps 1:1 onto OptionQuote  #
+    # (ARCHITECTURE §5.1) modulo dtype coercion at construction time.  #
+    # ---------------------------------------------------------------- #
+
+    def align_option_quotes(
+        self,
+        ticks: pd.DataFrame,
+        grid: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        """Per-minute NBBO + last-trade for one option contract.
+
+        Output columns (all on `grid`):
+            bid, ask, bid_size, ask_size               -- forward-filled
+            last_trade                                  -- forward-filled
+            quote_age_seconds                           -- max(bid_age, ask_age)
+            last_trade_age_seconds
+            is_locked   = (bid == ask) & both non-null
+            is_crossed  = (bid >  ask) & both non-null
+
+        `quote_age_seconds` reports the staler side of the NBBO so a
+        FillEngine staleness gate (`max_age_seconds`) trips on either
+        leg's drift, not the average. NaN until both sides have been
+        observed at least once — there is no NBBO to age before that.
+        """
+        cols = [
+            "bid", "ask", "bid_size", "ask_size", "last_trade",
+            "quote_age_seconds", "last_trade_age_seconds",
+            "is_locked", "is_crossed",
+        ]
+        if ticks is None or ticks.empty:
+            empty = pd.DataFrame({c: pd.Series(dtype="float64") for c in cols[:7]}, index=grid)
+            empty["is_locked"] = pd.Series(False, index=grid, dtype="bool")
+            empty["is_crossed"] = pd.Series(False, index=grid, dtype="bool")
+            return empty[cols]
+
+        idx = pd.to_datetime(ticks["time"], utc=True)
+        df = (
+            ticks.assign(_idx=idx)
+            .drop(columns=["time"], errors="ignore")
+            .set_index("_idx")
+            .sort_index()
+        )
+
+        bid_rows = df[df["type"] == "BID"]
+        ask_rows = df[df["type"] == "ASK"]
+        trade_rows = df[df["type"] == "TRADE"]
+
+        # Last-per-minute price + size for each event type.
+        fresh_bid = bid_rows["value"].resample(self.GRID_FREQ).last().reindex(grid)
+        fresh_bid_size = (
+            bid_rows["size"].resample(self.GRID_FREQ).last().reindex(grid)
+            if "size" in bid_rows else pd.Series(np.nan, index=grid)
+        )
+        fresh_ask = ask_rows["value"].resample(self.GRID_FREQ).last().reindex(grid)
+        fresh_ask_size = (
+            ask_rows["size"].resample(self.GRID_FREQ).last().reindex(grid)
+            if "size" in ask_rows else pd.Series(np.nan, index=grid)
+        )
+        fresh_trade = trade_rows["value"].resample(self.GRID_FREQ).last().reindex(grid)
+
+        out = pd.DataFrame(index=grid)
+        out["bid"] = fresh_bid.ffill()
+        out["ask"] = fresh_ask.ffill()
+        out["bid_size"] = fresh_bid_size.ffill()
+        out["ask_size"] = fresh_ask_size.ffill()
+        out["last_trade"] = fresh_trade.ffill()
+
+        # Staleness clocks — NaN before first observation, +60s per minute since.
+        bid_age = self._age_seconds(fresh_bid)
+        ask_age = self._age_seconds(fresh_ask)
+        # max(skipna=False): NaN propagates if either side never observed.
+        out["quote_age_seconds"] = pd.concat([bid_age, ask_age], axis=1).max(
+            axis=1, skipna=False,
+        )
+        out["last_trade_age_seconds"] = self._age_seconds(fresh_trade)
+
+        # Derived NBBO state — only meaningful when both sides are present.
+        both = out["bid"].notna() & out["ask"].notna()
+        out["is_locked"] = (out["bid"] == out["ask"]) & both
+        out["is_crossed"] = (out["bid"] > out["ask"]) & both
+
+        return out[cols]
+
+    # ---------------------------------------------------------------- #
     # Top-level                                                        #
     # ---------------------------------------------------------------- #
 
@@ -323,6 +428,54 @@ class DataProcessor:
                 quotes=quotes,
             )
         return out
+
+    def process_vix_index_options(
+        self,
+        quotes_vintage: str | None = None,
+    ) -> pd.DataFrame:
+        """Load all VIX-idx option tick shards; return a unified per-minute
+        panel keyed on `(timestamp, contract_id)`.
+
+        Output schema maps 1:1 onto `OptionQuote` (ARCHITECTURE §5.1):
+            bid, ask, bid_size, ask_size, last_trade,
+            quote_age_seconds, last_trade_age_seconds,
+            is_locked, is_crossed.
+
+        Each contract is aligned to its OWN [first-tick, last-tick] minute
+        grid (not a global grid) — the cross-contract panel is therefore
+        sparse over the union of lifetimes. Querying `panel.loc[(ts, cid)]`
+        returns the latest forward-filled NBBO at `ts` for that contract,
+        or raises KeyError if `ts` is outside the contract's life.
+
+        `is_locked` / `is_crossed` are derived here per the chain ingestion
+        contract: Bloomberg does not expose them as flags on the wire.
+        """
+        try:
+            quote_shards = self._load_shards(
+                self.VIX_INDEX_OPTIONS_QUOTES_PRODUCT, quotes_vintage,
+            )
+        except FileNotFoundError:
+            return pd.DataFrame()
+
+        parts: list[pd.DataFrame] = []
+        for ticker, ticks in quote_shards.items():
+            if ticks is None or ticks.empty:
+                continue
+            t = pd.to_datetime(ticks["time"], utc=True)
+            grid = self.build_master_grid(
+                t.min().to_pydatetime(), t.max().to_pydatetime(),
+            )
+            per = self.align_option_quotes(ticks, grid)
+            per["contract_id"] = ticker
+            parts.append(per)
+
+        if not parts:
+            return pd.DataFrame()
+
+        panel = pd.concat(parts)
+        panel.index.name = "timestamp"
+        panel = panel.set_index("contract_id", append=True).sort_index()
+        return panel
 
     # ---------------------------------------------------------------- #
     # Ticker -> settlement_date                                        #

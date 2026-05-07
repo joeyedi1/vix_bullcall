@@ -248,3 +248,243 @@ def test_settlement_for_ticker(ticker, expected):
 def test_settlement_for_ticker_rejects_malformed(bad_ticker):
     with pytest.raises(ValueError):
         DataProcessor._settlement_for_ticker(bad_ticker)
+
+
+# --------------------------------------------------------------------------- #
+# align_option_quotes — schema, sizes, derived flags, staleness                #
+# --------------------------------------------------------------------------- #
+
+
+def _option_ticks(rows: list[dict]) -> pd.DataFrame:
+    """Helper: build a tick frame with the expected schema."""
+    return pd.DataFrame(rows, columns=["ticker", "time", "type", "value", "size"])
+
+
+def test_align_option_quotes_schema(proc, grid_6min):
+    """Empty input still produces the OptionQuote-aligned schema."""
+    out = proc.align_option_quotes(_option_ticks([]), grid_6min)
+    assert list(out.columns) == [
+        "bid", "ask", "bid_size", "ask_size", "last_trade",
+        "quote_age_seconds", "last_trade_age_seconds",
+        "is_locked", "is_crossed",
+    ]
+    assert len(out) == len(grid_6min)
+    assert out["is_locked"].dtype == bool
+    assert out["is_crossed"].dtype == bool
+
+
+def test_align_option_quotes_picks_last_per_minute_and_ffills(proc, grid_6min):
+    """Last BID/ASK in a minute wins; sizes track values; absent minutes ffill."""
+    ticks = _option_ticks([
+        # minute 0: bid 1.40 size 50, ask 1.50 size 60 (each updated mid-minute)
+        ("VIX X", "2025-10-16 22:00:30", "BID", 1.40, 50),
+        ("VIX X", "2025-10-16 22:00:45", "ASK", 1.50, 60),
+        # minute 2: bid bumps to 1.45 (size 30); no new ask
+        ("VIX X", "2025-10-16 22:02:10", "BID", 1.45, 30),
+        # minute 3: ask drops to 1.48 (size 10)
+        ("VIX X", "2025-10-16 22:03:50", "ASK", 1.48, 10),
+    ])
+    ticks["time"] = pd.to_datetime(ticks["time"], utc=True)
+    out = proc.align_option_quotes(ticks, grid_6min)
+    # Minute 0: fresh bid+ask
+    assert out.loc["2025-10-16 22:00:00+00:00", "bid"] == pytest.approx(1.40)
+    assert out.loc["2025-10-16 22:00:00+00:00", "ask"] == pytest.approx(1.50)
+    assert out.loc["2025-10-16 22:00:00+00:00", "bid_size"] == 50
+    assert out.loc["2025-10-16 22:00:00+00:00", "ask_size"] == 60
+    # Minute 1: ffill — same as minute 0
+    assert out.loc["2025-10-16 22:01:00+00:00", "bid"] == pytest.approx(1.40)
+    assert out.loc["2025-10-16 22:01:00+00:00", "ask"] == pytest.approx(1.50)
+    # Minute 2: bid updated, ask ffilled
+    assert out.loc["2025-10-16 22:02:00+00:00", "bid"] == pytest.approx(1.45)
+    assert out.loc["2025-10-16 22:02:00+00:00", "bid_size"] == 30
+    assert out.loc["2025-10-16 22:02:00+00:00", "ask"] == pytest.approx(1.50)
+    # Minute 3: ask updated
+    assert out.loc["2025-10-16 22:03:00+00:00", "ask"] == pytest.approx(1.48)
+    assert out.loc["2025-10-16 22:03:00+00:00", "ask_size"] == 10
+    # Minute 5: both still ffilled to last seen
+    assert out.loc["2025-10-16 22:05:00+00:00", "bid"] == pytest.approx(1.45)
+    assert out.loc["2025-10-16 22:05:00+00:00", "ask"] == pytest.approx(1.48)
+
+
+def test_align_option_quotes_is_locked_and_is_crossed(proc, grid_6min):
+    """Derived flags fire only when both sides are non-null AND match the
+    NBBO state."""
+    ticks = _option_ticks([
+        # minute 0: normal NBBO bid<ask
+        ("VIX X", "2025-10-16 22:00:30", "BID", 1.40, 50),
+        ("VIX X", "2025-10-16 22:00:45", "ASK", 1.50, 60),
+        # minute 2: locked — bid bumps to 1.50 (== ask)
+        ("VIX X", "2025-10-16 22:02:10", "BID", 1.50, 25),
+        # minute 4: crossed — bid bumps further to 1.55 (> ask 1.50)
+        ("VIX X", "2025-10-16 22:04:30", "BID", 1.55, 10),
+    ])
+    ticks["time"] = pd.to_datetime(ticks["time"], utc=True)
+    out = proc.align_option_quotes(ticks, grid_6min)
+    # Minute 0: normal — neither flag
+    assert not out.loc["2025-10-16 22:00:00+00:00", "is_locked"]
+    assert not out.loc["2025-10-16 22:00:00+00:00", "is_crossed"]
+    # Minute 2: locked
+    assert bool(out.loc["2025-10-16 22:02:00+00:00", "is_locked"])
+    assert not out.loc["2025-10-16 22:02:00+00:00", "is_crossed"]
+    # Minute 4: crossed (bid > ask after bid bump)
+    assert not out.loc["2025-10-16 22:04:00+00:00", "is_locked"]
+    assert bool(out.loc["2025-10-16 22:04:00+00:00", "is_crossed"])
+
+
+def test_align_option_quotes_flags_false_when_either_side_missing(
+    proc, grid_6min,
+):
+    """is_locked/is_crossed must be False (not NaN) on minutes with one
+    side missing, even though `bid == ask` could be vacuously true if both
+    were NaN."""
+    ticks = _option_ticks([
+        # bid only — ask remains NaN through the whole grid
+        ("VIX X", "2025-10-16 22:01:00", "BID", 1.40, 50),
+    ])
+    ticks["time"] = pd.to_datetime(ticks["time"], utc=True)
+    out = proc.align_option_quotes(ticks, grid_6min)
+    assert (out["is_locked"] == False).all()  # noqa: E712
+    assert (out["is_crossed"] == False).all()  # noqa: E712
+
+
+def test_align_option_quotes_quote_age_is_max_of_sides(proc, grid_6min):
+    """quote_age_seconds = max(bid_age, ask_age) so a staleness gate trips
+    on the older side."""
+    ticks = _option_ticks([
+        ("VIX X", "2025-10-16 22:00:00", "BID", 1.40, 50),
+        ("VIX X", "2025-10-16 22:00:00", "ASK", 1.50, 60),
+        # bid is bumped at minute 3; ask stays stale
+        ("VIX X", "2025-10-16 22:03:00", "BID", 1.42, 50),
+    ])
+    ticks["time"] = pd.to_datetime(ticks["time"], utc=True)
+    out = proc.align_option_quotes(ticks, grid_6min)
+    # Minute 3: bid_age=0 (fresh), ask_age=180 (3 minutes since 22:00)
+    assert out.loc["2025-10-16 22:03:00+00:00", "quote_age_seconds"] == 180.0
+    # Minute 4: bid_age=60, ask_age=240 → max=240
+    assert out.loc["2025-10-16 22:04:00+00:00", "quote_age_seconds"] == 240.0
+    # Minute 5: bid_age=120, ask_age=300 → max=300
+    assert out.loc["2025-10-16 22:05:00+00:00", "quote_age_seconds"] == 300.0
+
+
+def test_align_option_quotes_quote_age_nan_until_both_sides_observed(
+    proc, grid_6min,
+):
+    """If only one side has been observed, the NBBO doesn't exist yet —
+    quote_age_seconds is NaN, not the age of the lone observed side."""
+    ticks = _option_ticks([
+        ("VIX X", "2025-10-16 22:01:00", "BID", 1.40, 50),
+        # No ASK ever observed
+    ])
+    ticks["time"] = pd.to_datetime(ticks["time"], utc=True)
+    out = proc.align_option_quotes(ticks, grid_6min)
+    assert out["quote_age_seconds"].isna().all()
+
+
+def test_align_option_quotes_last_trade_age_independent(proc, grid_6min):
+    """last_trade_age_seconds tracks TRADE events independently of BBO."""
+    ticks = _option_ticks([
+        ("VIX X", "2025-10-16 22:00:00", "BID", 1.40, 50),
+        ("VIX X", "2025-10-16 22:00:00", "ASK", 1.50, 60),
+        ("VIX X", "2025-10-16 22:02:00", "TRADE", 1.45, 5),
+    ])
+    ticks["time"] = pd.to_datetime(ticks["time"], utc=True)
+    out = proc.align_option_quotes(ticks, grid_6min)
+    # Minute 2: trade age 0; minute 5: trade age 180
+    assert out.loc["2025-10-16 22:02:00+00:00", "last_trade_age_seconds"] == 0.0
+    assert out.loc["2025-10-16 22:05:00+00:00", "last_trade_age_seconds"] == 180.0
+    # Minute 0/1: NaN before first trade
+    assert pd.isna(out.loc["2025-10-16 22:00:00+00:00", "last_trade_age_seconds"])
+
+
+# --------------------------------------------------------------------------- #
+# process_vix_index_options — multi-contract panel assembly                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_process_vix_index_options_panel_shape(tmp_path, proc):
+    """Two contracts, two parquets, expect MultiIndex (timestamp, contract_id)."""
+    raw_root = tmp_path / "data" / "raw"
+    d = raw_root / "blpapi" / "vix_index_options_quotes"
+    d.mkdir(parents=True)
+    vintage = "20260505T100000Z"
+
+    def _save(ticker: str, rows: list[dict]) -> None:
+        df = pd.DataFrame(rows)
+        df["ticker"] = ticker
+        # safe_shard_key strips spaces/slashes to underscores; the loader
+        # recovers the ticker from the in-data column, not the filename.
+        safe = "VIX_US_05_19_26_C20_Index" if "20" in ticker else "VIX_US_05_19_26_C21_Index"
+        df.to_parquet(d / f"{safe}_{vintage}.parquet", index=False)
+
+    rows_a = [
+        {"time": pd.Timestamp("2026-04-01 14:00:30", tz="UTC"),
+         "type": "BID", "value": 1.40, "size": 50},
+        {"time": pd.Timestamp("2026-04-01 14:00:45", tz="UTC"),
+         "type": "ASK", "value": 1.50, "size": 60},
+    ]
+    rows_b = [
+        {"time": pd.Timestamp("2026-04-01 14:00:30", tz="UTC"),
+         "type": "BID", "value": 1.10, "size": 30},
+        {"time": pd.Timestamp("2026-04-01 14:00:45", tz="UTC"),
+         "type": "ASK", "value": 1.20, "size": 25},
+    ]
+    _save("VIX US 05/19/26 C20 Index", rows_a)
+    _save("VIX US 05/19/26 C21 Index", rows_b)
+
+    p = DataProcessor(raw_root=raw_root)
+    panel = p.process_vix_index_options()
+
+    assert isinstance(panel.index, pd.MultiIndex)
+    assert panel.index.names == ["timestamp", "contract_id"]
+    expected_cols = {
+        "bid", "ask", "bid_size", "ask_size", "last_trade",
+        "quote_age_seconds", "last_trade_age_seconds",
+        "is_locked", "is_crossed",
+    }
+    assert set(panel.columns) == expected_cols
+    # Both contracts present
+    contract_ids = set(panel.index.get_level_values("contract_id"))
+    assert contract_ids == {
+        "VIX US 05/19/26 C20 Index",
+        "VIX US 05/19/26 C21 Index",
+    }
+    # Spot-check values for one contract
+    row_a = panel.loc[(pd.Timestamp("2026-04-01 14:00:00", tz="UTC"),
+                       "VIX US 05/19/26 C20 Index")]
+    assert row_a["bid"] == pytest.approx(1.40)
+    assert row_a["ask"] == pytest.approx(1.50)
+    assert row_a["bid_size"] == 50
+    assert row_a["ask_size"] == 60
+
+
+def test_process_vix_index_options_returns_empty_when_no_shards(tmp_path):
+    raw_root = tmp_path / "data" / "raw"
+    p = DataProcessor(raw_root=raw_root)
+    out = p.process_vix_index_options()
+    assert out.empty
+
+
+# --------------------------------------------------------------------------- #
+# _load_shards — recovers ticker from in-data column                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_load_shards_recovers_multitoken_ticker_from_data_column(tmp_path):
+    """`safe_shard_key` mangles the VIX option ticker; the loader must
+    recover it from the in-data `ticker` column rather than the filename."""
+    raw_root = tmp_path / "data" / "raw"
+    d = raw_root / "blpapi" / "vix_index_options_quotes"
+    d.mkdir(parents=True)
+    vintage = "20260505T100000Z"
+    ticker = "VIX US 05/19/26 C20 Index"  # has spaces AND slashes
+    df = pd.DataFrame({
+        "time": [pd.Timestamp("2026-04-01 14:00:30", tz="UTC")],
+        "type": ["BID"], "value": [1.4], "size": [50],
+        "ticker": [ticker],
+    })
+    df.to_parquet(d / f"VIX_US_05_19_26_C20_Index_{vintage}.parquet", index=False)
+
+    p = DataProcessor(raw_root=raw_root)
+    shards = p._load_shards("vix_index_options_quotes", vintage)
+    assert ticker in shards
+    assert len(shards) == 1
