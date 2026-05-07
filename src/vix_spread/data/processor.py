@@ -53,6 +53,7 @@ import numpy as np
 import pandas as pd
 
 from .expiry_calendar import CODE_TO_MONTH, vx_settlement_date
+from .vix_index_options import parse_vix_option_ticker
 
 
 _TICKER_RE = re.compile(r"^UX([A-Z])(\d{2})\s+Index$")
@@ -92,6 +93,7 @@ class DataProcessor:
     OHLCV_PRODUCT = "vx_futures_ohlcv"
     QUOTES_PRODUCT = "vx_futures_quotes"
     VIX_INDEX_OPTIONS_QUOTES_PRODUCT = "vix_index_options_quotes"
+    VIX_INDEX_OPTIONS_DAILY_PRODUCT = "vix_index_options_daily"
     GRID_FREQ = "1min"
     GRID_FREQ_SECONDS = 60
 
@@ -475,6 +477,79 @@ class DataProcessor:
         panel = pd.concat(parts)
         panel.index.name = "timestamp"
         panel = panel.set_index("contract_id", append=True).sort_index()
+        return panel
+
+    def process_vix_options_daily(
+        self,
+        daily_vintage: str | None = None,
+    ) -> pd.DataFrame:
+        """Load all VIX-idx daily option shards; return a wide pivoted panel
+        keyed on `MultiIndex(date, expiry, right, strike)` with columns
+        `[IVOL_LAST, PX_BID, PX_ASK, ...]` (whichever fields are present
+        in the shards).
+
+        This is the consumer-facing form for `ChainIVProvider`
+        (ARCHITECTURE §4.3) — its `__init__` validator checks for that
+        exact MultiIndex shape and the `IVOL_LAST / PX_BID / PX_ASK`
+        column subset.
+
+        Expiry normalization
+        --------------------
+        Bloomberg's ticker-date convention is asymmetric:
+          - Settled monthlies: ticker date == SOQ Wednesday
+            (e.g. `'VIX US 11/19/25 ...'`)
+          - Active monthlies:  ticker date == Tuesday last-trade
+            (e.g. `'VIX US 05/19/26 ...'`, with SOQ on Wed 5/20)
+        We normalize ALL `expiry` index values to the SOQ Wednesday via
+        `vx_settlement_date(year, month)` so downstream lookups keyed on
+        `product.expiry.date()` succeed regardless of contract state at
+        pull time. Without this, settled-month lookups would work but
+        active-month lookups would silently miss.
+
+        Tickers that don't match the canonical regex (weeklies, AM/PM
+        settlement variants, etc.) are silently skipped — same convention
+        as `filter_chain` in the ingestion path.
+        """
+        try:
+            shards = self._load_shards(
+                self.VIX_INDEX_OPTIONS_DAILY_PRODUCT, daily_vintage,
+            )
+        except FileNotFoundError:
+            return pd.DataFrame()
+
+        parts: list[pd.DataFrame] = []
+        for ticker, df in shards.items():
+            try:
+                parsed = parse_vix_option_ticker(ticker)
+            except ValueError:
+                continue
+            if df is None or df.empty:
+                continue
+
+            soq_wed = vx_settlement_date(
+                parsed.expiry_date.year, parsed.expiry_date.month,
+            )
+
+            pivot = df.pivot_table(
+                index="date", columns="field", values="value", aggfunc="last",
+            )
+            pivot = pivot.reset_index()
+            pivot["date"] = pd.to_datetime(pivot["date"]).dt.date
+            pivot["expiry"] = soq_wed
+            pivot["right"] = parsed.right
+            pivot["strike"] = float(parsed.strike)
+            parts.append(pivot)
+
+        if not parts:
+            return pd.DataFrame()
+
+        panel = pd.concat(parts, ignore_index=True, sort=False)
+        panel = panel.set_index(
+            ["date", "expiry", "right", "strike"]
+        ).sort_index()
+        # Drop the columns axis name introduced by pivot_table for
+        # clean __repr__ in downstream consumers.
+        panel.columns.name = None
         return panel
 
     # ---------------------------------------------------------------- #

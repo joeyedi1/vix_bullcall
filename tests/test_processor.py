@@ -488,3 +488,225 @@ def test_load_shards_recovers_multitoken_ticker_from_data_column(tmp_path):
     shards = p._load_shards("vix_index_options_quotes", vintage)
     assert ticker in shards
     assert len(shards) == 1
+
+
+# --------------------------------------------------------------------------- #
+# process_vix_options_daily — pivots long-form daily shards into the         #
+# ChainIVProvider-shaped MultiIndex panel.                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _save_daily_shard(
+    out_dir, ticker: str, vintage: str,
+    rows: list[tuple],   # (date, field, value)
+) -> None:
+    """Helper: write one per-contract daily parquet in long form."""
+    df = pd.DataFrame(
+        [
+            {"date": pd.Timestamp(d_), "ticker": ticker, "field": f, "value": v}
+            for (d_, f, v) in rows
+        ]
+    )
+    safe = ticker.replace(" ", "_").replace("/", "_")
+    df.to_parquet(out_dir / f"{safe}_{vintage}.parquet", index=False)
+
+
+def test_process_vix_options_daily_schema_and_pivot(tmp_path):
+    """Per-(date, field) values pivoted into columns; (expiry, right,
+    strike) added from the parsed ticker; MultiIndex names exact."""
+    from datetime import date as _date
+
+    raw = tmp_path / "data" / "raw"
+    d = raw / "blpapi" / "vix_index_options_daily"
+    d.mkdir(parents=True)
+    vintage = "20260505T100000Z"
+
+    _save_daily_shard(
+        d, "VIX US 04/15/26 C20 Index", vintage,
+        [
+            ("2026-04-01", "IVOL_LAST", 60.0),
+            ("2026-04-01", "PX_BID",     1.40),
+            ("2026-04-01", "PX_ASK",     1.50),
+            ("2026-04-02", "IVOL_LAST", 61.0),
+            ("2026-04-02", "PX_BID",     1.42),
+            ("2026-04-02", "PX_ASK",     1.52),
+        ],
+    )
+
+    p = DataProcessor(raw_root=raw)
+    panel = p.process_vix_options_daily()
+
+    assert isinstance(panel.index, pd.MultiIndex)
+    assert panel.index.names == ["date", "expiry", "right", "strike"]
+    for col in ("IVOL_LAST", "PX_BID", "PX_ASK"):
+        assert col in panel.columns
+
+    # Day-1 row: pivot resolved correctly
+    key = (_date(2026, 4, 1), _date(2026, 4, 15), "C", 20.0)
+    assert key in panel.index
+    assert panel.loc[key, "IVOL_LAST"] == 60.0
+    assert panel.loc[key, "PX_BID"] == pytest.approx(1.40)
+    assert panel.loc[key, "PX_ASK"] == pytest.approx(1.50)
+
+    # Day-2 row: independent
+    assert panel.loc[(_date(2026, 4, 2), _date(2026, 4, 15), "C", 20.0), "PX_BID"] == pytest.approx(1.42)
+
+
+def test_process_vix_options_daily_normalizes_active_ticker_date_to_soq_wednesday(
+    tmp_path,
+):
+    """Settled tickers encode SOQ Wednesday; active tickers encode the
+    Tuesday last-trade. The panel must normalize ALL expiries to the
+    SOQ Wednesday so ChainIVProvider lookups (keyed on product.expiry.date()
+    = SOQ Wed) succeed regardless of contract state at pull time.
+    """
+    from datetime import date as _date
+
+    raw = tmp_path / "data" / "raw"
+    d = raw / "blpapi" / "vix_index_options_daily"
+    d.mkdir(parents=True)
+    vintage = "20260505T100000Z"
+
+    # SETTLED: April 2026 monthly — Bloomberg ticker date = SOQ Wed 4/15.
+    _save_daily_shard(
+        d, "VIX US 04/15/26 C20 Index", vintage,
+        [("2026-04-01", "IVOL_LAST", 60.0),
+         ("2026-04-01", "PX_BID", 1.40),
+         ("2026-04-01", "PX_ASK", 1.50)],
+    )
+    # ACTIVE: May 2026 monthly — Bloomberg ticker date = Tuesday 5/19,
+    # SOQ Wednesday is 5/20 (vx_settlement_date(2026, 5)).
+    _save_daily_shard(
+        d, "VIX US 05/19/26 P18 Index", vintage,
+        [("2026-04-01", "IVOL_LAST", 55.0),
+         ("2026-04-01", "PX_BID", 0.80),
+         ("2026-04-01", "PX_ASK", 0.85)],
+    )
+
+    panel = DataProcessor(raw_root=raw).process_vix_options_daily()
+
+    # Settled — ticker date already Wed; expiry index unchanged.
+    settled = (_date(2026, 4, 1), _date(2026, 4, 15), "C", 20.0)
+    assert settled in panel.index
+    assert panel.loc[settled, "IVOL_LAST"] == 60.0
+
+    # Active — ticker date 5/19 (Tue); expiry NORMALIZED to 5/20 (Wed SOQ).
+    active = (_date(2026, 4, 1), _date(2026, 5, 20), "P", 18.0)
+    assert active in panel.index, "active expiry should normalize to SOQ Wed"
+    assert panel.loc[active, "IVOL_LAST"] == 55.0
+    # The Tuesday key should NOT be present.
+    bad = (_date(2026, 4, 1), _date(2026, 5, 19), "P", 18.0)
+    assert bad not in panel.index
+
+
+def test_process_vix_options_daily_skips_unparseable_tickers(tmp_path):
+    """Weeklies / AM-PM variants whose ticker form doesn't match the
+    standard regex are silently skipped (same convention as the ingestion
+    `filter_chain`)."""
+    from datetime import date as _date
+
+    raw = tmp_path / "data" / "raw"
+    d = raw / "blpapi" / "vix_index_options_daily"
+    d.mkdir(parents=True)
+    vintage = "20260505T100000Z"
+
+    _save_daily_shard(
+        d, "VIX US 04/15/26 C20 Index", vintage,
+        [("2026-04-01", "IVOL_LAST", 60.0),
+         ("2026-04-01", "PX_BID", 1.40),
+         ("2026-04-01", "PX_ASK", 1.50)],
+    )
+    # An obviously-non-conforming ticker (still saved by the ingestion
+    # path because it carries the column).
+    _save_daily_shard(
+        d, "GARBAGE TICKER", vintage,
+        [("2026-04-01", "IVOL_LAST", 99.0)],
+    )
+
+    panel = DataProcessor(raw_root=raw).process_vix_options_daily()
+    # Standard one survives, garbage one dropped.
+    assert (_date(2026, 4, 1), _date(2026, 4, 15), "C", 20.0) in panel.index
+    assert len(panel) == 1
+
+
+def test_process_vix_options_daily_returns_empty_when_no_shards(tmp_path):
+    raw = tmp_path / "data" / "raw"
+    panel = DataProcessor(raw_root=raw).process_vix_options_daily()
+    assert panel.empty
+
+
+def test_process_vix_options_daily_handles_multiple_strikes_and_rights(tmp_path):
+    """A realistic multi-contract pull: 2 strikes × 2 rights × 1 expiry."""
+    from datetime import date as _date
+
+    raw = tmp_path / "data" / "raw"
+    d = raw / "blpapi" / "vix_index_options_daily"
+    d.mkdir(parents=True)
+    vintage = "20260505T100000Z"
+
+    for strike in (18, 20):
+        for right_letter, mid in [("C", 1.5), ("P", 0.9)]:
+            _save_daily_shard(
+                d, f"VIX US 04/15/26 {right_letter}{strike} Index", vintage,
+                [
+                    ("2026-04-01", "IVOL_LAST", 50.0 + strike),
+                    ("2026-04-01", "PX_BID", mid - 0.05),
+                    ("2026-04-01", "PX_ASK", mid + 0.05),
+                ],
+            )
+
+    panel = DataProcessor(raw_root=raw).process_vix_options_daily()
+    assert len(panel) == 4
+    # Spot-check one
+    key = (_date(2026, 4, 1), _date(2026, 4, 15), "C", 18.0)
+    assert panel.loc[key, "IVOL_LAST"] == 68.0
+    # Index sorted
+    assert list(panel.index.get_level_values("right").unique()) == ["C", "P"]
+
+
+def test_process_vix_options_daily_panel_satisfies_chain_iv_provider(tmp_path):
+    """End-to-end: the panel produced here must construct + serve a
+    ChainIVProvider lookup without further massaging. This is the
+    integration contract."""
+    from datetime import date as _date, datetime as _dt, timezone as _tz
+
+    from vix_spread.pricing.black76 import Black76Pricer
+    from vix_spread.pricing.forward_selector import Forward
+    from vix_spread.pricing.leg_iv import ChainIVProvider, LegIVSource
+    from vix_spread.products.vix_index_option import VIXIndexOption
+
+    raw = tmp_path / "data" / "raw"
+    d = raw / "blpapi" / "vix_index_options_daily"
+    d.mkdir(parents=True)
+    vintage = "20260505T100000Z"
+
+    _save_daily_shard(
+        d, "VIX US 04/15/26 C20 Index", vintage,
+        [("2026-04-01", "IVOL_LAST", 70.0),
+         ("2026-04-01", "PX_BID", 1.40),
+         ("2026-04-01", "PX_ASK", 1.50)],
+    )
+
+    panel = DataProcessor(raw_root=raw).process_vix_options_daily()
+    pricer = Black76Pricer()
+    provider = ChainIVProvider(panel, pricer)
+
+    settlement = _dt(2026, 4, 15, 14, 30, tzinfo=_tz.utc)
+    product = VIXIndexOption(
+        contract_root="VIX",
+        expiry=settlement,                # SOQ Wed — matches normalized expiry index
+        settlement_event=settlement,
+        strike=20.0,
+        right="call",
+    )
+    forward = Forward(
+        value=22.0, selection_method="settlement_date_match",
+        model_risk_flag=False, settlement_date=settlement,
+    )
+    iv = provider.get(
+        product=product,
+        as_of=_dt(2026, 4, 1, 14, 0, tzinfo=_tz.utc),
+        forward=forward, risk_free_rate=0.04,
+    )
+    assert iv.source == LegIVSource.VENDOR
+    assert iv.value == pytest.approx(0.70)  # 70.0 / 100
