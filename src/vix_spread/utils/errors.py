@@ -32,3 +32,11 @@ class FlatVolError(ValueError):
     VVIX (a flat-vol index) being substituted for strike-specific IVs —
     pricing a vertical with σ_long == σ_short loses the skew information
     the spread depends on."""
+
+
+class LegIVResolutionError(ValueError):
+    """Raised when `ChainIVProvider` cannot produce an IV for the requested
+    (strike, expiry, right) — vendor `IVOL_LAST` is missing AND the
+    Black-76 midpoint inversion fails (no quotes, target outside achievable
+    range, etc.). Refusing here prevents NaN propagation into Black-76,
+    which would silently corrupt every Greek downstream."""
