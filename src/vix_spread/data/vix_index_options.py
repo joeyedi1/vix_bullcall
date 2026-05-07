@@ -46,6 +46,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from .base import BaseDataFetcher, RawPullManifest, make_vintage
+from .expiry_calendar import vx_settlement_date
 
 try:  # pragma: no cover
     import blpapi  # type: ignore
@@ -109,6 +110,88 @@ def parse_vix_option_ticker(ticker: str) -> VIXOptionContract:
         right=right,
         strike=float(strike),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Manual chain reconstruction (for already-settled expiries that have dropped #
+# out of OPT_CHAIN). Used by `enumerate_historical_chain` below.              #
+# --------------------------------------------------------------------------- #
+
+
+def cboe_vix_strike_grid(lo: float = 5.0, hi: float = 200.0) -> list[float]:
+    """Generous-superset Cboe VIX option strike grid.
+
+    Empirical Cboe convention (verified against the live OPT_CHAIN response):
+      - 0.5 increments at low strikes (5 - 30)
+      - 1.0 increments mid (30 - 50)
+      - 2.5 increments above (50 - 100)
+      - 5.0 increments at high strikes (100 - 200)
+
+    Bands overlap at the boundaries (30, 50, 100) so integer strikes are
+    not dropped at transitions; deduplication is handled by the set in the
+    accumulator. Caller MUST validate each candidate against Bloomberg
+    (`_validate_tickers_batch`) — strikes never listed will fail with
+    `BAD_SEC` and are silently dropped.
+    """
+    bands = (
+        (5.0, 30.0, 0.5),
+        (30.0, 50.0, 1.0),
+        (50.0, 100.0, 2.5),
+        (100.0, 200.0, 5.0),
+    )
+    out: set[float] = set()
+    for band_lo, band_hi, step in bands:
+        a = max(band_lo, lo)
+        b = min(band_hi, hi)
+        if a > b + 1e-9:
+            continue
+        n_steps = int(round((b - a) / step))
+        for i in range(n_steps + 1):
+            s = round(a + i * step, 2)
+            if lo - 1e-9 <= s <= hi + 1e-9:
+                out.add(s)
+    return sorted(out)
+
+
+def vix_option_ticker_date(year: int, month: int) -> date:
+    """Bloomberg-ticker date for the SETTLED monthly VIX option whose
+    underlying VX cycle is `(year, month)`. **Returns the SOQ Wednesday.**
+
+    Bloomberg's ticker-date convention is asymmetric across the contract
+    lifecycle (verified empirically 2026-05-05):
+
+      - **Active / currently-listed** monthlies use the Tuesday LAST-TRADE
+        date (e.g. `VIX US 05/19/26 C20 Index` for the May 2026 monthly
+        whose SOQ is Wed May 20). These tickers come from `OPT_CHAIN` and
+        do NOT require manual construction — `resolve_chain` discovers
+        them directly.
+      - **Already-settled** monthlies use the Wednesday SOQ date
+        (e.g. `VIX US 04/15/26 C20 Index` for the April 2026 monthly that
+        settled Wed Apr 15). The Tuesday form returns BAD_SEC. This
+        function exists to construct THESE tickers for historical
+        backfill via `enumerate_historical_chain`.
+
+    Holiday rollback: if VX SOQ Wednesday rolled to Tuesday (e.g. Juneteenth
+    2024-06-19), `vx_settlement_date` returns the rolled-back Tuesday and
+    this function returns the same Tuesday. Empirically untested for the
+    rollback case; surface as a follow-up if a Juneteenth-month historical
+    backfill returns 0 validated contracts.
+    """
+    return vx_settlement_date(year, month)
+
+
+def construct_vix_option_ticker(ticker_date: date, right: str, strike: float) -> str:
+    """`(date(2026, 5, 19), 'C', 20.0)` -> `'VIX US 05/19/26 C20 Index'`.
+
+    Strike formatting matches the OPT_CHAIN-emitted form: integer strikes
+    drop the decimal (`20.0` → `'20'`), half-strikes keep one decimal
+    (`20.5` → `'20.5'`, `42.5` → `'42.5'`). Format `:g` handles both.
+    """
+    if right not in ('C', 'P'):
+        raise ValueError(f"right must be 'C' or 'P', got {right!r}")
+    mo, d, yy = ticker_date.month, ticker_date.day, ticker_date.year % 100
+    strike_str = f"{strike:g}"
+    return f"VIX US {mo:02d}/{d:02d}/{yy:02d} {right}{strike_str} Index"
 
 
 class VIXIndexOptionsChainFetcher(BaseDataFetcher):
@@ -256,6 +339,104 @@ class VIXIndexOptionsChainFetcher(BaseDataFetcher):
             )[: atm_window * 2 + 1]
             keep.extend(bucket)
         return sorted(keep, key=lambda c: (c.expiry_date, c.right, c.strike))
+
+    # ---------------------------------------------------------------- #
+    # Historical-chain reconstruction                                  #
+    #                                                                  #
+    # `OPT_CHAIN` returns only currently-listed contracts, so already- #
+    # settled monthlies (e.g. Nov 2025 - Apr 2026 in our backtest      #
+    # window) drop out. We reconstruct them by:                        #
+    #   1. Computing the Bloomberg ticker date for the expiry month.   #
+    #   2. Generating Cboe-spec candidate strikes (generous superset). #
+    #   3. Validating each candidate via ReferenceDataRequest in       #
+    #      batches; BAD_SEC = was never listed, silently dropped.      #
+    # The result is the actually-listed contract set for that expiry.  #
+    # ---------------------------------------------------------------- #
+
+    def _validate_tickers_batch(
+        self,
+        candidates: list[str],
+        chunk_size: int = 250,
+    ) -> set[str]:
+        """Return the subset of `candidates` that resolve on Bloomberg.
+
+        Bloomberg's `ReferenceDataRequest` accepts hundreds of securities
+        per request; we chunk at `chunk_size` to stay well under any cap.
+        Each chunk requests `NAME` only — the lightest possible field. A
+        candidate with a `securityError` element is treated as BAD_SEC and
+        dropped; everything else is considered listed.
+        """
+        if not candidates:
+            return set()
+        valid: set[str] = set()
+        session = self._open_blpapi_session()
+        try:
+            svc = session.getService("//blp/refdata")
+            for i in range(0, len(candidates), chunk_size):
+                chunk = candidates[i : i + chunk_size]
+                req = svc.createRequest("ReferenceDataRequest")
+                for s in chunk:
+                    req.append("securities", s)
+                req.append("fields", "NAME")
+                session.sendRequest(req)
+
+                done = False
+                while not done:
+                    ev = session.nextEvent(timeout=self.timeout_ms)
+                    for msg in ev:
+                        if not msg.hasElement("securityData"):
+                            continue
+                        arr = msg.getElement("securityData")
+                        for j in range(arr.numValues()):
+                            sd = arr.getValue(j)
+                            sec = sd.getElementAsString("security")
+                            if sd.hasElement("securityError"):
+                                continue
+                            valid.add(sec)
+                    if ev.eventType() == blpapi.Event.RESPONSE:
+                        done = True
+            return valid
+        finally:
+            session.stop()
+
+    def enumerate_historical_chain(
+        self,
+        year: int,
+        month: int,
+        *,
+        strike_lo: float = 5.0,
+        strike_hi: float = 200.0,
+    ) -> list[VIXOptionContract]:
+        """Reconstruct the (year, month) standard-monthly VIX option chain
+        by candidate construction + Bloomberg validation.
+
+        Returns the list of contracts that Bloomberg recognizes today.
+        Empty list = either Bloomberg has no record of any strike for
+        this expiry (unlikely for standard monthlies) or the ticker form
+        on this terminal differs from `'VIX US M/D/YY {C|P}{strike} Index'`.
+        """
+        ticker_date = vix_option_ticker_date(year, month)
+        strikes = cboe_vix_strike_grid(strike_lo, strike_hi)
+        candidates: list[tuple[str, VIXOptionContract]] = []
+        for strike in strikes:
+            for right in ("C", "P"):
+                tk = construct_vix_option_ticker(ticker_date, right, strike)
+                candidates.append(
+                    (
+                        tk,
+                        VIXOptionContract(
+                            ticker=tk,
+                            expiry_date=ticker_date,
+                            right=right,
+                            strike=strike,
+                        ),
+                    )
+                )
+        valid_tickers = self._validate_tickers_batch([t for t, _ in candidates])
+        return sorted(
+            (c for t, c in candidates if t in valid_tickers),
+            key=lambda c: (c.right, c.strike),
+        )
 
     # ---------------------------------------------------------------- #
     # Per-contract data pulls                                          #

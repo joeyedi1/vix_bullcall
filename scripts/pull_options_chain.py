@@ -55,6 +55,9 @@ from vix_spread.data.vix_index_options import (  # noqa: E402
     VIXIndexOptionsChainFetcher,
     VIXOptionContract,
 )
+from vix_spread.data.vix_index_options import (  # noqa: E402
+    vix_option_ticker_date,
+)
 from vix_spread.data.vx_future_options import (  # noqa: E402
     VXFutureOptionsChainFetcher,
     VXOptionContract,
@@ -171,6 +174,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p_vix.add_argument("--limit", type=int, default=None,
                        help="optional cap on contracts (smoke testing)")
 
+    # ---- vix-index-historical ---- #
+    p_hist = sub.add_parser(
+        "vix-index-historical", parents=[common],
+        help=(
+            "Daily backfill for already-settled VIX index option monthly "
+            "expiries (drops out of OPT_CHAIN once the contract has settled). "
+            "Reconstructs the chain by Cboe strike-grid construction + "
+            "ReferenceDataRequest validation."
+        ),
+    )
+    p_hist.add_argument("--start", required=True, type=date.fromisoformat,
+                        help="ISO date YYYY-MM-DD for the daily series start")
+    p_hist.add_argument("--end", required=True, type=date.fromisoformat,
+                        help="ISO date YYYY-MM-DD for the daily series end")
+    p_hist.add_argument(
+        "--months", required=True,
+        help="comma-sep YYYY-MM list, e.g. '2025-11,2025-12,2026-01,2026-02,2026-03,2026-04'",
+    )
+    p_hist.add_argument("--atm-window", type=int, default=20,
+                        help="strikes each side of ATM (default 20)")
+    p_hist.add_argument("--atm-price", type=float, default=None,
+                        help="ATM reference price; default = median spot VIX over window")
+    p_hist.add_argument("--strike-lo", type=float, default=5.0,
+                        help="candidate-grid low bound (default 5.0)")
+    p_hist.add_argument("--strike-hi", type=float, default=200.0,
+                        help="candidate-grid high bound (default 200.0)")
+
     # ---- vx-future ---- #
     p_vx = sub.add_parser(
         "vx-future", parents=[common],
@@ -280,6 +310,87 @@ def _cmd_vix_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_months(s: str) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            y_str, m_str = tok.split("-")
+            y, m = int(y_str), int(m_str)
+        except (ValueError, AttributeError) as exc:
+            raise SystemExit(f"--months entries must be YYYY-MM, got {tok!r}") from exc
+        if not (1 <= m <= 12):
+            raise SystemExit(f"month out of range in {tok!r}")
+        out.append((y, m))
+    if not out:
+        raise SystemExit("--months may not be empty")
+    return out
+
+
+def _cmd_vix_index_historical(args: argparse.Namespace) -> int:
+    if args.start > args.end:
+        raise SystemExit(f"--start ({args.start}) is after --end ({args.end})")
+
+    months = _parse_months(args.months)
+    raw_root = Path(args.raw_root)
+
+    atm = args.atm_price
+    if atm is None:
+        atm = _median_spot_vix(
+            raw_root,
+            datetime.combine(args.start, datetime.min.time()),
+            datetime.combine(args.end, datetime.min.time()),
+        )
+        if atm is None:
+            raise SystemExit(
+                "--atm-price not provided and no vix_history_daily shard found. "
+                "Run `pull_data.py vix-history` first or pass --atm-price."
+            )
+        print(f"[vix-index-historical] atm_price = {atm:.2f} (median spot VIX)")
+
+    fetcher = VIXIndexOptionsChainFetcher(
+        host=args.host, port=args.port, raw_root=args.raw_root,
+    )
+
+    # Per-month: enumerate via Cboe strike grid + Bloomberg validation,
+    # then ATM-window-filter the survivors.
+    contracts: list[VIXOptionContract] = []
+    for y, m in months:
+        ticker_date = vix_option_ticker_date(y, m)
+        print(f"[vix-index-historical] enumerating {y}-{m:02d} (ticker date {ticker_date}) ...")
+        listed = fetcher.enumerate_historical_chain(
+            y, m, strike_lo=args.strike_lo, strike_hi=args.strike_hi,
+        )
+        print(f"  -> {len(listed)} contracts validated by Bloomberg")
+        if not listed:
+            continue
+        # ATM-window filter, per (right) bucket.
+        for right in ("C", "P"):
+            bucket = sorted(
+                (c for c in listed if c.right == right),
+                key=lambda c: abs(c.strike - atm),
+            )[: args.atm_window * 2 + 1]
+            contracts.extend(bucket)
+
+    if not contracts:
+        raise SystemExit("No historical contracts validated. "
+                         "Check ticker form / Bloomberg subscription.")
+    contracts.sort(key=lambda c: (c.expiry_date, c.right, c.strike))
+    print(f"[vix-index-historical] total filtered contracts: {len(contracts)}")
+
+    # Daily-only — quotes won't be available for already-settled options
+    # given the ~45-day Bloomberg intraday-history ceiling.
+    start_dt = datetime.combine(args.start, datetime.min.time())
+    end_dt = datetime.combine(args.end, datetime.max.time().replace(microsecond=0))
+    manifests = fetcher.pull(
+        start=start_dt, end=end_dt, contracts=contracts, kinds=("daily",),
+    )
+    _print_manifests("vix-index-historical", manifests)
+    return 0
+
+
 def _cmd_vx_future(args: argparse.Namespace) -> int:
     if args.start >= args.end:
         raise SystemExit(f"--start ({args.start}) is not before --end ({args.end})")
@@ -333,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_vro(args)
     if args.cmd == "vix-index":
         return _cmd_vix_index(args)
+    if args.cmd == "vix-index-historical":
+        return _cmd_vix_index_historical(args)
     if args.cmd == "vx-future":
         return _cmd_vx_future(args)
     raise SystemExit(f"unknown cmd: {args.cmd}")
