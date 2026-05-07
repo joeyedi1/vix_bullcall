@@ -1,14 +1,66 @@
+"""FillEngine — converts (spread, quotes, signal) into ExecutedFill or RejectedOrder.
+
+ARCHITECTURE §5. The validation memo's largest performance-inflation
+defect was treating fair value as a fill; this engine NEVER consumes a
+TheoreticalPrice (`is_executable=False` is rejected at the type level).
+
+Fill modes
+----------
+  SYNTHETIC_BIDASK (default, base case):
+    open_debit  = long.ask − short.bid    (you pay)
+    Conservative — exactly what a naive sweep would cross.
+
+  MIDPOINT (optimistic sensitivity):
+    open_debit  = mid(long) − mid(short)
+                = ((long.bid+long.ask)/2) − ((short.bid+short.ask)/2)
+    REQUIRES `accept_midpoint_optimism=True` per call. Emits no fees and
+    overstates realized fills; reserved for sensitivity analysis only.
+
+  SYNTHETIC_PLUS_SLIPPAGE (stressed sensitivity):
+    Not yet wired in this first pass — slippage configuration (per-leg
+    tick count, short-only flag) is a Phase-5 concern. NotImplementedError
+    is a loud refusal pending that wiring.
+
+Rejection priority (earliest wins)
+----------------------------------
+  1. reject_no_bid_short_leg  (validation-memo critical)
+  2. reject_locked_or_crossed (per leg)
+  3. max_quote_age_seconds    (per leg)
+  4. min_displayed_size       (per leg/side)
+  5. max_leg_spread_pct       (per leg)
+  6. max_order_size_pct_of_displayed
+
+Out of scope for this first pass
+--------------------------------
+  - Tick rounding (`tick_rounded` always reported as False).
+  - Per-product fees (`fees_per_spread` always 0.0).
+  - min_leg_open_interest, min_leg_volume_today — these need daily chain
+    data not on OptionQuote; will wire when the side-channel reaches the
+    engine.
+  - Same-minute / next-minute decision-timestamp causality check — that
+    convention is owned by the caller (broadcaster + bar-aware runner);
+    enforced structurally upstream, not duplicated here.
+  - Intent (open vs close) — entry-debit semantics assumed. Exits go
+    through ExitEngine when wired.
+"""
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Literal
+from typing import Any, Literal
 
 from vix_spread.products.spread import BullCallSpread
 
 from .fill_modes import FillMode
+from .liquidity_gates import LiquidityGates
 from .quote import OptionQuote
+from .synthetic_quote import SyntheticSpreadQuote
 
-if TYPE_CHECKING:
-    from vix_spread.execution.liquidity_gates import LiquidityGates
+
+RejectReason = Literal[
+    'no_bid_short', 'stale_quote', 'gate_fail',
+    'locked', 'crossed', 'tick_invalid', 'session_closed',
+]
 
 
 @dataclass(frozen=True)
@@ -28,8 +80,7 @@ class ExecutedFill:
 class RejectedOrder:
     timestamp: datetime
     spread: BullCallSpread
-    reason: Literal['no_bid_short', 'stale_quote', 'gate_fail',
-                    'locked', 'crossed', 'tick_invalid', 'session_closed']
+    reason: RejectReason
     detail: dict
 
 
@@ -75,4 +126,146 @@ class FillEngine:
                 "Base case is SYNTHETIC_BIDASK; midpoint is an optimistic "
                 "sensitivity scenario that must be opted into per run."
             )
-        ...
+        if order_size <= 0:
+            raise ValueError(f"order_size must be positive; got {order_size}.")
+        if gates is None:
+            raise ValueError(
+                "FillEngine.attempt_fill requires explicit `gates` "
+                "(LiquidityGates). Skipping gates is not a supported mode."
+            )
+
+        ts = long_q.timestamp  # caller is responsible for matched-timestamp legs
+
+        gate_failure = self._evaluate_gates(spread, long_q, short_q, order_size, gates)
+        if gate_failure is not None:
+            reason, detail = gate_failure
+            return RejectedOrder(
+                timestamp=ts, spread=spread, reason=reason, detail=detail,
+            )
+
+        # Compute per-leg fill prices and aggregate debit.
+        if mode is FillMode.SYNTHETIC_BIDASK:
+            long_fill = float(long_q.ask)
+            short_fill = float(short_q.bid)
+            debit = SyntheticSpreadQuote.open_debit_synthetic(long_q, short_q)
+        elif mode is FillMode.MIDPOINT:
+            long_fill = 0.5 * (float(long_q.bid) + float(long_q.ask))
+            short_fill = 0.5 * (float(short_q.bid) + float(short_q.ask))
+            debit = long_fill - short_fill
+        elif mode is FillMode.SYNTHETIC_PLUS_SLIPPAGE:
+            raise NotImplementedError(
+                "SYNTHETIC_PLUS_SLIPPAGE not yet wired — slippage config "
+                "(per-leg ticks, short-only flag) is a Phase-5 concern."
+            )
+        else:
+            raise ValueError(f"unknown FillMode: {mode!r}")
+
+        return ExecutedFill(
+            timestamp=ts,
+            spread=spread,
+            debit_per_spread=float(debit),
+            size=int(order_size),
+            fill_mode=mode,
+            long_leg_fill=long_fill,
+            short_leg_fill=short_fill,
+            tick_rounded=False,             # first-pass: no tick rounding
+            fees_per_spread=0.0,            # first-pass: no fees
+        )
+
+    # ---------------------------------------------------------------- #
+    # Gate evaluation                                                   #
+    # ---------------------------------------------------------------- #
+
+    @staticmethod
+    def _evaluate_gates(
+        spread: BullCallSpread,
+        long_q: OptionQuote,
+        short_q: OptionQuote,
+        order_size: int,
+        gates: LiquidityGates,
+    ) -> tuple[RejectReason, dict[str, Any]] | None:
+        """Returns `None` on pass, else `(reason, detail)`. Earliest
+        violation wins so the rejection log records the most-severe cause.
+        """
+        # 1. No-bid short leg — validation-memo critical, cheapest check.
+        if gates.reject_no_bid_short_leg and short_q.bid <= 0.0:
+            return ('no_bid_short', {'short_bid': float(short_q.bid)})
+
+        # 2. Locked / Crossed (per leg).
+        if gates.reject_locked_or_crossed:
+            if long_q.is_locked or short_q.is_locked:
+                return ('locked', {
+                    'long_locked': long_q.is_locked,
+                    'short_locked': short_q.is_locked,
+                })
+            if long_q.is_crossed or short_q.is_crossed:
+                return ('crossed', {
+                    'long_crossed': long_q.is_crossed,
+                    'short_crossed': short_q.is_crossed,
+                })
+
+        # 3. Staleness — per-leg quote_age_seconds vs threshold.
+        if long_q.quote_age_seconds > gates.max_quote_age_seconds:
+            return ('stale_quote', {
+                'leg': 'long', 'age_s': float(long_q.quote_age_seconds),
+                'max_s': gates.max_quote_age_seconds,
+            })
+        if short_q.quote_age_seconds > gates.max_quote_age_seconds:
+            return ('stale_quote', {
+                'leg': 'short', 'age_s': float(short_q.quote_age_seconds),
+                'max_s': gates.max_quote_age_seconds,
+            })
+
+        # 4. Min displayed size — every side of every leg must clear.
+        if gates.min_displayed_size > 0:
+            sizes = {
+                'long_bid_size': long_q.bid_size,
+                'long_ask_size': long_q.ask_size,
+                'short_bid_size': short_q.bid_size,
+                'short_ask_size': short_q.ask_size,
+            }
+            if any(s < gates.min_displayed_size for s in sizes.values()):
+                return ('gate_fail', {
+                    'sub_reason': 'min_displayed_size',
+                    'min': gates.min_displayed_size,
+                    'sizes': sizes,
+                })
+
+        # 5. Max leg spread pct — per leg.
+        for leg_name, q in (('long', long_q), ('short', short_q)):
+            mid = 0.5 * (float(q.bid) + float(q.ask))
+            if mid <= 0.0:
+                return ('gate_fail', {
+                    'sub_reason': 'non_positive_mid',
+                    'leg': leg_name, 'bid': q.bid, 'ask': q.ask,
+                })
+            spread_pct = (float(q.ask) - float(q.bid)) / mid
+            if spread_pct > gates.max_leg_spread_pct:
+                return ('gate_fail', {
+                    'sub_reason': 'leg_spread_pct',
+                    'leg': leg_name,
+                    'spread_pct': spread_pct,
+                    'max_pct': gates.max_leg_spread_pct,
+                })
+
+        # 6. Order size vs displayed — entry crosses long.ask and short.bid.
+        # Both must clear the displayed-pct gate independently.
+        if gates.max_order_size_pct_of_displayed < 1.0:
+            for leg_name, displayed in (
+                ('long_ask', long_q.ask_size),
+                ('short_bid', short_q.bid_size),
+            ):
+                if displayed <= 0:
+                    continue
+                ratio = order_size / float(displayed)
+                if ratio > gates.max_order_size_pct_of_displayed:
+                    return ('gate_fail', {
+                        'sub_reason': 'order_size_pct_of_displayed',
+                        'side': leg_name,
+                        'order_size': int(order_size),
+                        'displayed': int(displayed),
+                        'ratio': ratio,
+                        'max_ratio': gates.max_order_size_pct_of_displayed,
+                    })
+
+        return None

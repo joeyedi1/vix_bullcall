@@ -410,33 +410,54 @@ class VIXIndexOptionsChainFetcher(BaseDataFetcher):
         """Reconstruct the (year, month) standard-monthly VIX option chain
         by candidate construction + Bloomberg validation.
 
+        Tries BOTH Bloomberg ticker date forms because the convention
+        depends on whether the contract has settled at pull time:
+          - settled monthlies use the Wednesday SOQ date (e.g. `04/15/26`)
+          - active monthlies use the Tuesday last-trade date (e.g. `05/19/26`)
+        Both candidates are submitted; the surviving form per (right,
+        strike) is the one Bloomberg recognizes. This makes the function
+        usable for a unified single-vintage pull across both settled and
+        active months without needing a per-month state lookup.
+
         Returns the list of contracts that Bloomberg recognizes today.
-        Empty list = either Bloomberg has no record of any strike for
-        this expiry (unlikely for standard monthlies) or the ticker form
-        on this terminal differs from `'VIX US M/D/YY {C|P}{strike} Index'`.
+        Empty list = the ticker form on this terminal differs from
+        `'VIX US M/D/YY {C|P}{strike} Index'` for any candidate.
         """
-        ticker_date = vix_option_ticker_date(year, month)
+        soq_wed = vix_option_ticker_date(year, month)
+        last_trade_tue = soq_wed - timedelta(days=1)
         strikes = cboe_vix_strike_grid(strike_lo, strike_hi)
+
         candidates: list[tuple[str, VIXOptionContract]] = []
-        for strike in strikes:
-            for right in ("C", "P"):
-                tk = construct_vix_option_ticker(ticker_date, right, strike)
-                candidates.append(
-                    (
-                        tk,
-                        VIXOptionContract(
-                            ticker=tk,
-                            expiry_date=ticker_date,
-                            right=right,
-                            strike=strike,
-                        ),
+        for ticker_date in (soq_wed, last_trade_tue):
+            for strike in strikes:
+                for right in ("C", "P"):
+                    tk = construct_vix_option_ticker(ticker_date, right, strike)
+                    candidates.append(
+                        (
+                            tk,
+                            VIXOptionContract(
+                                ticker=tk,
+                                expiry_date=ticker_date,
+                                right=right,
+                                strike=strike,
+                            ),
+                        )
                     )
-                )
+
         valid_tickers = self._validate_tickers_batch([t for t, _ in candidates])
-        return sorted(
-            (c for t, c in candidates if t in valid_tickers),
-            key=lambda c: (c.right, c.strike),
-        )
+
+        # Dedupe: same (right, strike) may resolve via only ONE of the two
+        # forms — keep that one. If somehow both resolve, prefer the SOQ
+        # Wednesday form (canonical for settled contracts).
+        survivors: dict[tuple[str, float], VIXOptionContract] = {}
+        for tk, c in candidates:
+            if tk not in valid_tickers:
+                continue
+            key = (c.right, c.strike)
+            existing = survivors.get(key)
+            if existing is None or c.expiry_date == soq_wed:
+                survivors[key] = c
+        return sorted(survivors.values(), key=lambda c: (c.right, c.strike))
 
     # ---------------------------------------------------------------- #
     # Per-contract data pulls                                          #
