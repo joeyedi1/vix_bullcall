@@ -20,8 +20,12 @@ foot-guns on tz-aware lookups.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vix_spread.execution.quote import OptionQuote
 
 
 @dataclass(frozen=True)
@@ -58,3 +62,30 @@ class OptionsMarketSnapshot:
     """
     timestamp: datetime
     vx_curve: dict[date, float]
+
+
+@dataclass(frozen=True)
+class VIXSnapshot:
+    """Per-decision market context bundle (ARCHITECTURE §6.2).
+
+    Bundles everything `SpreadEvaluator.evaluate` needs at one moment:
+
+      - `timestamp`: decision time (tz-aware UTC).
+      - `vx_curve`: settlement_date → VX future price; consumed by
+        `ForwardSelector.settlement_date_match`. Duck-typed compatible
+        with `OptionsMarketSnapshot` so the existing selector accepts a
+        VIXSnapshot directly.
+      - `options_quotes`: contract_id → `OptionQuote`; consumed by the
+        `FillEngine`. The contract_id form is whatever the per-minute
+        NBBO panel exposes (Tuesday last-trade form for active VIX
+        index options — see `vix_option_active_contract_id`).
+      - `risk_free_rate`: float, fed to Black-76 discounting.
+      - `vix_spot`: DIAGNOSTIC ONLY. Validation memo §12.2 / §4.1: spot
+        VIX is FORBIDDEN as a Black-76 forward input. The field is here
+        for reporting / regime overlays only; never for pricing.
+    """
+    timestamp: datetime
+    vx_curve: dict[date, float]
+    options_quotes: dict[str, "OptionQuote"] = field(default_factory=dict)
+    risk_free_rate: float = 0.0
+    vix_spot: float | None = None

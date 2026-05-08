@@ -194,6 +194,28 @@ def construct_vix_option_ticker(ticker_date: date, right: str, strike: float) ->
     return f"VIX US {mo:02d}/{d:02d}/{yy:02d} {right}{strike_str} Index"
 
 
+def vix_option_active_contract_id(product) -> str:
+    """Bloomberg contract_id for an ACTIVE VIX-index monthly option.
+
+    Returns the **Tuesday last-trade-date** form (e.g. `'VIX US 05/19/26
+    C20 Index'` for the May 2026 monthly whose SOQ Wednesday is May 20).
+    This is the form used in the per-minute NBBO panel produced by
+    `DataProcessor.process_vix_index_options` — `OptionQuote.contract_id`
+    matches Bloomberg's exact ticker as recorded at ingestion.
+
+    Caller passes a `Product` whose `.expiry` is the canonical SOQ Wed
+    (matches the daily-panel index). We subtract 1 calendar day to get
+    the Tuesday and format as a Bloomberg ticker.
+
+    NOTE: Juneteenth-rolled SOQs (rare, holiday-adjusted to Tuesday) are
+    not handled here — for those, the "last trade" would be the preceding
+    Monday. Untested; surface as a follow-up if it bites.
+    """
+    last_trade = product.expiry.date() - timedelta(days=1)
+    right_short = product.right[0].upper()
+    return construct_vix_option_ticker(last_trade, right_short, product.strike)
+
+
 class VIXIndexOptionsChainFetcher(BaseDataFetcher):
     """Pulls 1-min NBBO ticks + daily chain reference for VIX index options.
 

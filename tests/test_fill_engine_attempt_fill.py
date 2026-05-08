@@ -128,13 +128,79 @@ def test_midpoint_debit_is_mid_minus_mid(engine, spread, gates):
     assert out.fill_mode is FillMode.MIDPOINT
 
 
-def test_synthetic_plus_slippage_not_yet_wired(engine, spread, gates):
+def test_synthetic_plus_slippage_default_one_tick_per_leg(engine, spread, gates):
+    """SYNTHETIC_PLUS_SLIPPAGE with default 1 tick/leg @ $0.05 tick value:
+    long fills at ask+0.05, short fills at bid-0.05, debit = synthetic + 0.10.
+    """
     long_q = _q("VIX_C20", bid=2.10, ask=2.20)
     short_q = _q("VIX_C22", bid=0.95, ask=1.05)
-    with pytest.raises(NotImplementedError, match="SYNTHETIC_PLUS_SLIPPAGE"):
+    out = engine.attempt_fill(
+        spread=spread, long_q=long_q, short_q=short_q,
+        order_size=1, mode=FillMode.SYNTHETIC_PLUS_SLIPPAGE, gates=gates,
+    )
+    assert isinstance(out, ExecutedFill)
+    # synthetic = 2.20 - 0.95 = 1.25; +0.05 long, +0.05 short = 1.35
+    assert out.debit_per_spread == pytest.approx(1.35)
+    assert out.long_leg_fill == pytest.approx(2.25)
+    assert out.short_leg_fill == pytest.approx(0.90)
+    assert out.fill_mode is FillMode.SYNTHETIC_PLUS_SLIPPAGE
+
+
+def test_synthetic_plus_slippage_short_leg_only(engine, spread, gates):
+    """`slippage_apply_to_short_leg_only=True`: only short leg slipped."""
+    long_q = _q("VIX_C20", bid=2.10, ask=2.20)
+    short_q = _q("VIX_C22", bid=0.95, ask=1.05)
+    out = engine.attempt_fill(
+        spread=spread, long_q=long_q, short_q=short_q,
+        order_size=1, mode=FillMode.SYNTHETIC_PLUS_SLIPPAGE, gates=gates,
+        slippage_apply_to_short_leg_only=True,
+    )
+    assert isinstance(out, ExecutedFill)
+    # long unchanged at 2.20, short slipped 0.05 -> 0.90, debit = 1.30
+    assert out.long_leg_fill == pytest.approx(2.20)
+    assert out.short_leg_fill == pytest.approx(0.90)
+    assert out.debit_per_spread == pytest.approx(1.30)
+
+
+def test_synthetic_plus_slippage_configurable_ticks_and_tick_value(
+    engine, spread, gates,
+):
+    """Larger N ticks / different tick value scale linearly into debit."""
+    long_q = _q("VIX_C20", bid=2.10, ask=2.20)
+    short_q = _q("VIX_C22", bid=0.95, ask=1.05)
+    out = engine.attempt_fill(
+        spread=spread, long_q=long_q, short_q=short_q,
+        order_size=1, mode=FillMode.SYNTHETIC_PLUS_SLIPPAGE, gates=gates,
+        slippage_ticks_per_leg=3, tick_value=0.01,
+    )
+    assert isinstance(out, ExecutedFill)
+    # 3 ticks * $0.01 = $0.03 per leg; both legs = $0.06 added
+    assert out.debit_per_spread == pytest.approx(1.31)
+
+
+def test_synthetic_plus_slippage_zero_ticks_equals_synthetic_bidask(
+    engine, spread, gates,
+):
+    """0 ticks slippage degenerates to the SYNTHETIC_BIDASK debit."""
+    long_q = _q("VIX_C20", bid=2.10, ask=2.20)
+    short_q = _q("VIX_C22", bid=0.95, ask=1.05)
+    out = engine.attempt_fill(
+        spread=spread, long_q=long_q, short_q=short_q,
+        order_size=1, mode=FillMode.SYNTHETIC_PLUS_SLIPPAGE, gates=gates,
+        slippage_ticks_per_leg=0,
+    )
+    assert isinstance(out, ExecutedFill)
+    assert out.debit_per_spread == pytest.approx(1.25)
+
+
+def test_negative_slippage_ticks_raises(engine, spread, gates):
+    long_q = _q("VIX_C20", bid=2.10, ask=2.20)
+    short_q = _q("VIX_C22", bid=0.95, ask=1.05)
+    with pytest.raises(ValueError, match="non-negative"):
         engine.attempt_fill(
             spread=spread, long_q=long_q, short_q=short_q,
             order_size=1, mode=FillMode.SYNTHETIC_PLUS_SLIPPAGE, gates=gates,
+            slippage_ticks_per_leg=-1,
         )
 
 

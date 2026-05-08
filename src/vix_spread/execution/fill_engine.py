@@ -97,6 +97,11 @@ class FillEngine:
     fills raise LookaheadError. There is no flag to disable this check.
     """
 
+    # VIX-option tick size (Cboe spec). Hard-coded for Phase-5 first-pass
+    # slippage; per-product tick rounding (and hence per-product tick value)
+    # belongs to the tick_rules layer when it lands.
+    DEFAULT_TICK_VALUE: float = 0.05
+
     def attempt_fill(
         self,
         spread: BullCallSpread,
@@ -108,12 +113,24 @@ class FillEngine:
         decision_timestamp: datetime | None = None,
         *,
         accept_midpoint_optimism: bool = False,
+        slippage_ticks_per_leg: int = 1,
+        slippage_apply_to_short_leg_only: bool = False,
+        tick_value: float | None = None,
     ) -> 'ExecutedFill | RejectedOrder':
         """Returns ExecutedFill or RejectedOrder. NEVER consumes a
         TheoreticalPrice — Black-76 fair values are diagnostics, not fills.
         Both leg arguments must be OptionQuote instances; anything else
         (notably TheoreticalPrice, which carries is_executable=False) raises
-        TypeError at the entry of the function."""
+        TypeError at the entry of the function.
+
+        Slippage parameters apply only when `mode == SYNTHETIC_PLUS_SLIPPAGE`:
+          * `slippage_ticks_per_leg` — N ticks of adverse slippage per leg.
+            Default 1, matching ARCH §10.3 default.
+          * `slippage_apply_to_short_leg_only` — if True, only the short
+            leg is slipped. Default False (both legs slipped).
+          * `tick_value` — dollar value per tick. Defaults to
+            `DEFAULT_TICK_VALUE` ($0.05 for VIX options).
+        """
         if not isinstance(long_q, OptionQuote) or not isinstance(short_q, OptionQuote):
             raise TypeError(
                 "FillEngine.attempt_fill accepts only OptionQuote leg inputs. "
@@ -132,6 +149,11 @@ class FillEngine:
             raise ValueError(
                 "FillEngine.attempt_fill requires explicit `gates` "
                 "(LiquidityGates). Skipping gates is not a supported mode."
+            )
+        if slippage_ticks_per_leg < 0:
+            raise ValueError(
+                f"slippage_ticks_per_leg must be non-negative; "
+                f"got {slippage_ticks_per_leg}."
             )
 
         ts = long_q.timestamp  # caller is responsible for matched-timestamp legs
@@ -153,10 +175,15 @@ class FillEngine:
             short_fill = 0.5 * (float(short_q.bid) + float(short_q.ask))
             debit = long_fill - short_fill
         elif mode is FillMode.SYNTHETIC_PLUS_SLIPPAGE:
-            raise NotImplementedError(
-                "SYNTHETIC_PLUS_SLIPPAGE not yet wired — slippage config "
-                "(per-leg ticks, short-only flag) is a Phase-5 concern."
-            )
+            tv = self.DEFAULT_TICK_VALUE if tick_value is None else float(tick_value)
+            slip_per_leg = float(slippage_ticks_per_leg) * tv
+            # Long leg buys at ask + slippage (worse) unless short-only.
+            # Short leg sells at bid - slippage (worse) always.
+            long_slip = 0.0 if slippage_apply_to_short_leg_only else slip_per_leg
+            short_slip = slip_per_leg
+            long_fill = float(long_q.ask) + long_slip
+            short_fill = float(short_q.bid) - short_slip
+            debit = long_fill - short_fill
         else:
             raise ValueError(f"unknown FillMode: {mode!r}")
 
