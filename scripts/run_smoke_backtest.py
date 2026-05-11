@@ -31,6 +31,7 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from vix_spread.backtest.audit import RegimeAuditTrail  # noqa: E402
 from vix_spread.backtest.reporting import (  # noqa: E402
     format_three_scenario_summary,
     run_three_scenarios,
@@ -298,6 +299,160 @@ def build_exit_decider():
 # --------------------------------------------------------------------------- #
 
 
+def _run_regime_diagnostic(feature_panel) -> int:
+    """Refit the HMM at multiple as_of points across the lookback and
+    print emission_summary + Frobenius drifts + VIX-level membership.
+
+    Each refit slices `feature_panel.slice_causal('log_vix', as_of)` to
+    the (as_of - 1260d, as_of] window and runs the GaussianHMM. So we
+    see how the LEARNED MEANS / VARIANCES evolve over time — and at the
+    final refit, what cluster VIX 14, 18, 22, 25 land in.
+    """
+    spec = HMMSpec(
+        n_states=2,
+        transition_matrix=np.array([[0.96, 0.04], [0.117, 0.883]]),
+        state_label_rule="by_emission_variance",
+    )
+    fitter = WalkForwardRegimeFitter(
+        spec=spec, feature_column="log_vix", lookback_days=1260,
+        cadence="weekly", random_state=0,
+        hypothesis_tag="contrarian_tail",
+    )
+
+    # Quarterly refits 2024-Q1 → 2026-Q1 (9 refits across 2 years).
+    refit_asofs = [
+        pd.Timestamp(t, tz="UTC")
+        for t in (
+            "2024-01-31", "2024-04-30", "2024-07-31", "2024-10-31",
+            "2025-01-31", "2025-04-30", "2025-07-31", "2025-10-31",
+            "2026-01-31",
+        )
+    ]
+    print("=" * 78)
+    print("HMM REGIME DIAGNOSTIC DUMP")
+    print("=" * 78)
+    print(f"Lookback per refit: 1260 days (rolling)")
+    print(f"Underlying:         log(VIX) daily close")
+    print(f"Label rule:         by_emission_variance (state 0 = lower variance)")
+    print(f"Refit dates:        {len(refit_asofs)} quarterly fits "
+          f"{refit_asofs[0].date()} → {refit_asofs[-1].date()}")
+    print()
+
+    print("Fitting ...", flush=True)
+    t0 = time.time()
+    for as_of in refit_asofs:
+        try:
+            fitter.fit_walk_forward(feature_panel, as_of.to_pydatetime())
+        except Exception as exc:
+            print(f"  fit at {as_of.date()}: {type(exc).__name__}: {exc}")
+    print(f"  done in {time.time() - t0:.1f}s")
+    print()
+
+    trail = RegimeAuditTrail.from_walk_forward_fitter(fitter)
+
+    # --- Emission summary: log-space and VIX-space ---
+    summary = trail.emission_summary()
+    if summary.empty:
+        print("(no refits captured)")
+        return 0
+
+    print("EMISSION PARAMETERS (per-refit, stable-label-keyed)")
+    print("-" * 78)
+    print(f"{'date':<14s}{'log_μ_S0':>12s}{'log_μ_S1':>12s}"
+          f"{'log_σ_S0':>12s}{'log_σ_S1':>12s}"
+          f"{'VIX_S0':>10s}{'VIX_S1':>10s}")
+    for ts, row in summary.iterrows():
+        log_mu_0 = row["mean_state_0"]
+        log_mu_1 = row["mean_state_1"]
+        log_var_0 = row["var_state_0"]
+        log_var_1 = row["var_state_1"]
+        log_sd_0 = float(np.sqrt(log_var_0))
+        log_sd_1 = float(np.sqrt(log_var_1))
+        vix_0 = float(np.exp(log_mu_0))   # geometric mean VIX in low-vol state
+        vix_1 = float(np.exp(log_mu_1))
+        print(f"{ts.date()!s:<14s}"
+              f"{log_mu_0:>12.4f}{log_mu_1:>12.4f}"
+              f"{log_sd_0:>12.4f}{log_sd_1:>12.4f}"
+              f"{vix_0:>10.2f}{vix_1:>10.2f}")
+    print()
+    print(f"  log_μ  = mean of log(VIX) in each state (state 0 = low-vol).")
+    print(f"  log_σ  = standard deviation of log(VIX) in each state.")
+    print(f"  VIX_Sk = exp(log_μ_Sk) = geometric mean VIX level for state k.")
+    print()
+
+    # --- VIX-space ±1σ band on the FINAL refit ---
+    final = summary.iloc[-1]
+    log_mu_0 = float(final["mean_state_0"])
+    log_mu_1 = float(final["mean_state_1"])
+    log_var_0 = float(final["var_state_0"])
+    log_var_1 = float(final["var_state_1"])
+    log_sd_0 = float(np.sqrt(log_var_0))
+    log_sd_1 = float(np.sqrt(log_var_1))
+    print(f"VIX-SPACE ±1σ BANDS (final refit, {summary.index[-1].date()})")
+    print("-" * 78)
+    print(f"  state_0 (low-vol):  "
+          f"geo-mean VIX = {np.exp(log_mu_0):.2f}, "
+          f"±1σ band = [{np.exp(log_mu_0 - log_sd_0):.2f}, "
+          f"{np.exp(log_mu_0 + log_sd_0):.2f}]")
+    print(f"  state_1 (high-vol): "
+          f"geo-mean VIX = {np.exp(log_mu_1):.2f}, "
+          f"±1σ band = [{np.exp(log_mu_1 - log_sd_1):.2f}, "
+          f"{np.exp(log_mu_1 + log_sd_1):.2f}]")
+    print()
+
+    # --- Stability metrics ---
+    fro_diffs = trail.transmat_frobenius_diffs().dropna()
+    stat_drifts = trail.stationary_drifts().dropna()
+    print("STABILITY METRICS")
+    print("-" * 78)
+    if len(fro_diffs):
+        print(f"  transmat Frobenius diff:   "
+              f"mean = {float(fro_diffs.mean()):.4f}   "
+              f"max = {float(fro_diffs.max()):.4f}")
+    if len(stat_drifts):
+        print(f"  stationary L2 drift:       "
+              f"mean = {float(stat_drifts.mean()):.4f}   "
+              f"max = {float(stat_drifts.max()):.4f}")
+    print(f"  label_map consistent:      {trail.label_map_consistent()}")
+    print()
+
+    # --- VIX-level membership on the final refit, prior = stationary ---
+    final_refit = trail.refits[-1]
+    # Reorder means/variances by stable label so state 0 = low-vol-by-spec.
+    n = len(final_refit.label_map)
+    stable_mu = np.empty(n)
+    stable_var = np.empty(n)
+    stable_pi = np.empty(n)
+    for raw_idx, stable_label in enumerate(final_refit.label_map):
+        stable_mu[stable_label] = float(final_refit.means[raw_idx])
+        stable_var[stable_label] = float(final_refit.variances[raw_idx])
+        stable_pi[stable_label] = float(final_refit.stationary[raw_idx])
+
+    def _state_posterior(vix: float) -> tuple[float, float]:
+        """Posterior P(state | VIX) using Gaussian emission likelihood
+        × stationary prior. Returns (P(state_0), P(state_1))."""
+        x = float(np.log(vix))
+        # Unnormalized log-posteriors.
+        log_p = -0.5 * np.log(2.0 * np.pi * stable_var) \
+                - 0.5 * (x - stable_mu) ** 2 / stable_var + np.log(stable_pi)
+        m = log_p.max()
+        p = np.exp(log_p - m)
+        p /= p.sum()
+        return float(p[0]), float(p[1])
+
+    print(f"VIX-LEVEL → STATE MEMBERSHIP (final refit, prior = stationary)")
+    print("-" * 78)
+    print(f"{'VIX':>6s}{'P(low-vol)':>14s}{'P(high-vol)':>14s}{'verdict':>14s}")
+    for vix_level in (12, 14, 16, 18, 20, 22, 25, 28, 32):
+        p0, p1 = _state_posterior(float(vix_level))
+        verdict = "LOW" if p0 > p1 else "HIGH"
+        print(f"{vix_level:>6d}{p0:>14.4f}{p1:>14.4f}{verdict:>14s}")
+    print()
+    print(f"  Stationary distribution at final refit: "
+          f"π_low = {stable_pi[0]:.4f}, π_high = {stable_pi[1]:.4f}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -316,6 +471,16 @@ def main() -> int:
             "optimistic (MIDPOINT), stressed (SYNTHETIC_PLUS_SLIPPAGE) — "
             "and emit a side-by-side comparison per ARCH §8.2. "
             "~3x compute; data prep is shared across scenarios."
+        ),
+    )
+    parser.add_argument(
+        "--regime-diagnostic", action="store_true",
+        help=(
+            "Run the HMM regime diagnostic dump: refits the HMM at a "
+            "quarterly cadence across the lookback window, builds a "
+            "RegimeAuditTrail, and prints emission_summary + Frobenius "
+            "diffs + VIX-level state-membership probabilities. Skips the "
+            "backtest. Useful for diagnosing 'what did the model learn?'."
         ),
     )
     args = parser.parse_args()
@@ -350,6 +515,10 @@ def main() -> int:
         f"  feature panel: {feature_panel.features.shape}, "
         f"{feature_panel.dates.min()} → {feature_panel.dates.max()}"
     )
+
+    if args.regime_diagnostic:
+        print()
+        return _run_regime_diagnostic(feature_panel)
 
     print()
     print("[3/8] Computing daily curve slope (M1/M2) ...")
