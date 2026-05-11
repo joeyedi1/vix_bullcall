@@ -143,6 +143,16 @@ class RegimeAuditTrail:
         first = self.refits[0].label_map
         return all(r.label_map == first for r in self.refits)
 
+    def label_map_flip_dates(self) -> list[datetime]:
+        """`as_of` timestamps of refits whose `label_map` differs from
+        the first refit's. Empty list when `label_map_consistent()` is
+        True. The first refit is never in the list (it's the reference).
+        """
+        if not self.refits:
+            return []
+        first = self.refits[0].label_map
+        return [r.as_of for r in self.refits if r.label_map != first]
+
     def transmat_frobenius_diffs(self) -> pd.Series:
         """Frobenius distance between consecutive refits' transition
         matrices. Index = the LATER refit's `as_of`; value = distance to

@@ -414,6 +414,10 @@ def _run_regime_diagnostic(feature_panel) -> int:
               f"mean = {float(stat_drifts.mean()):.4f}   "
               f"max = {float(stat_drifts.max()):.4f}")
     print(f"  label_map consistent:      {trail.label_map_consistent()}")
+    flip_dates = trail.label_map_flip_dates()
+    if flip_dates:
+        print(f"  label_map flipped at:      "
+              f"{', '.join(d.date().isoformat() for d in flip_dates)}")
     print()
 
     # --- VIX-level membership on the final refit, prior = stationary ---

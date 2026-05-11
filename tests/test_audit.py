@@ -198,6 +198,16 @@ def test_regime_audit_trail_detects_label_flip():
         flipped,
     ])
     assert trail.label_map_consistent() is False
+    flips = trail.label_map_flip_dates()
+    assert flips == [datetime(2026, 2, 1, tzinfo=timezone.utc)]
+
+
+def test_regime_audit_trail_no_flip_dates_when_consistent():
+    trail = RegimeAuditTrail(refits=[
+        _stable_refit(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        _stable_refit(datetime(2026, 2, 1, tzinfo=timezone.utc)),
+    ])
+    assert trail.label_map_flip_dates() == []
 
 
 def test_regime_audit_trail_transmat_frobenius_diffs():
