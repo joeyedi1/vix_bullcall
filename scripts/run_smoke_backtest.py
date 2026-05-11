@@ -26,6 +26,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
@@ -245,7 +250,13 @@ def build_market_at(
     return market_at
 
 
-def build_signal_at(minute_signals_df: pd.DataFrame, hypothesis_tag: str):
+def build_signal_at(
+    minute_signals_df: pd.DataFrame,
+    hypothesis_tag: str,
+    n_states: int,
+):
+    prob_cols = [f"p_state_{k}" for k in range(n_states)]
+
     def signal_at(T):
         ts = pd.Timestamp(T)
         try:
@@ -261,7 +272,7 @@ def build_signal_at(minute_signals_df: pd.DataFrame, hypothesis_tag: str):
         )
         return RegimeSignal(
             as_of=as_of_eff_dt,
-            filtered_probs=np.array([row["p_low"], row["p_high"]]),
+            filtered_probs=np.array([float(row[c]) for c in prob_cols]),
             state_label=int(row["state_label"]),
             curve_features={"slope_m1_m2": float(row["slope_m1_m2"])},
             hypothesis_tag=hypothesis_tag,
@@ -535,9 +546,15 @@ def main() -> int:
 
     print()
     print("[4/8] Fitting HMM at smoke start ...")
+    # 3-state, 1260d — calibrated config per scripts/calibrate_regime.py.
+    # state_0 = low-vol (geo-VIX ~13.5), state_1 = mid (~16.5), state_2 = high (~22).
     spec = HMMSpec(
-        n_states=2,
-        transition_matrix=np.array([[0.96, 0.04], [0.117, 0.883]]),
+        n_states=3,
+        transition_matrix=np.array(
+            [[0.94, 0.05, 0.01],
+             [0.05, 0.90, 0.05],
+             [0.01, 0.05, 0.94]],
+        ),
         state_label_rule="by_emission_variance",
     )
     fitter = WalkForwardRegimeFitter(
@@ -548,6 +565,7 @@ def main() -> int:
     fitted_at_start = fitter.fit_walk_forward(feature_panel, as_of=SMOKE_START)
     print(f"  fit on {len(fitted_at_start.observations):,} observations")
     print(f"  label_map: {fitted_at_start.label_map}")
+    n_states = spec.n_states
 
     print()
     print("[5/8] Generating daily regime + curve signals ...")
@@ -580,24 +598,25 @@ def main() -> int:
             print(f"  signal at {d_close_utc}: {type(exc).__name__}: {exc}")
             continue
         slope = slope_series.asof(pd.Timestamp(d))
-        daily_rows.append(
-            {
-                "as_of": pd.Timestamp(d_close_utc),
-                "state_label": sig.state_label,
-                "p_low": float(sig.filtered_probs[0]),
-                "p_high": float(sig.filtered_probs[1]),
-                "slope_m1_m2": float(slope) if not pd.isna(slope) else 0.0,
-            }
-        )
+        row = {
+            "as_of": pd.Timestamp(d_close_utc),
+            "state_label": sig.state_label,
+            "slope_m1_m2": float(slope) if not pd.isna(slope) else 0.0,
+        }
+        for k in range(n_states):
+            row[f"p_state_{k}"] = float(sig.filtered_probs[k])
+        daily_rows.append(row)
     daily_signals = pd.DataFrame(daily_rows).set_index("as_of")
     print(f"  daily signals: {len(daily_signals)}")
     print(f"  state_label distribution: {dict(Counter(daily_signals['state_label']))}")
-    print(
-        f"  p_low range:    "
-        f"{daily_signals['p_low'].min():.3f} → "
-        f"{daily_signals['p_low'].max():.3f} "
-        f"(median {daily_signals['p_low'].median():.3f})"
-    )
+    for k in range(n_states):
+        col = f"p_state_{k}"
+        print(
+            f"  {col} range:  "
+            f"{daily_signals[col].min():.3f} → "
+            f"{daily_signals[col].max():.3f} "
+            f"(median {daily_signals[col].median():.3f})"
+        )
     print(
         f"  slope range:    "
         f"{daily_signals['slope_m1_m2'].min():.3f} → "
@@ -622,7 +641,9 @@ def main() -> int:
 
     chain_dates = set(chain_panel.index.get_level_values("date").unique())
     market_at = build_market_at(quotes_by_minute, uxk26, chain_dates)
-    signal_at = build_signal_at(minute_signals, hypothesis_tag="contrarian_tail")
+    signal_at = build_signal_at(
+        minute_signals, hypothesis_tag="contrarian_tail", n_states=n_states,
+    )
     exit_decider = build_exit_decider()
 
     print()
