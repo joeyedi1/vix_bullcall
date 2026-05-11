@@ -70,7 +70,12 @@ class HMMSpec:
             raise HMMSpecificationError(
                 f"No eigenvalue near 1 in transition matrix; got {eigvals}."
             )
-        vec = np.maximum(eigvecs[:, idx].real, 0.0)
+        raw = eigvecs[:, idx].real
+        # np.linalg.eig returns eigenvectors up to sign; flip if the dominant
+        # direction is negative so we don't zero a valid stationary like [1/3]*n.
+        if raw.sum() < 0:
+            raw = -raw
+        vec = np.maximum(raw, 0.0)
         s = vec.sum()
         if s <= 0:
             raise HMMSpecificationError(
