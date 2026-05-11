@@ -121,3 +121,52 @@ def make_contrarian_tail_hypothesis(
         entry_curve_filter=curve_filter,
         expected_holding_period=expected_holding_period,
     )
+
+
+def make_high_vol_stress_test_hypothesis(
+    *,
+    high_vol_state_label: int = 2,
+    min_filtered_prob: float = 0.7,
+    min_contango_slope: float = 0.03,
+    curve_feature_key: str = "slope_30_182",
+    expected_holding_period: timedelta = timedelta(days=21),
+) -> StrategyHypothesis:
+    """DIAGNOSTIC ONLY — target the high-vol state to exercise the trade
+    machinery when the headline contrarian_tail can't fire.
+
+    Same structure as `make_contrarian_tail_hypothesis` but enters on
+    state_label = `high_vol_state_label` (default 2 under the calibrated
+    3-state spec; state 2 = highest-variance state under the
+    `by_emission_variance` label rule). Curve filter and holding period
+    are unchanged — only the regime gate flips.
+
+    This is not a strategy hypothesis under research; it exists to let
+    FillEngine / Sizer / Three-Scenario reporting exercise on windows
+    where every day sits in the high-vol regime (e.g., the Mar-May 2026
+    smoke window). Do not report results from this factory as a
+    backtest of the contrarian_tail thesis.
+    """
+    if not (0.0 < min_filtered_prob <= 1.0):
+        raise ValueError(
+            f"min_filtered_prob must be in (0, 1]; got {min_filtered_prob}."
+        )
+
+    def regime_filter(signal: "RegimeSignal") -> bool:
+        if signal.state_label != high_vol_state_label:
+            return False
+        if high_vol_state_label >= len(signal.filtered_probs):
+            return False
+        return float(signal.filtered_probs[high_vol_state_label]) >= min_filtered_prob
+
+    def curve_filter(features: dict[str, float]) -> bool:
+        slope = features.get(curve_feature_key)
+        if slope is None:
+            return False
+        return float(slope) >= min_contango_slope
+
+    return StrategyHypothesis(
+        name="contrarian_tail",
+        entry_regime_filter=regime_filter,
+        entry_curve_filter=curve_filter,
+        expected_holding_period=expected_holding_period,
+    )

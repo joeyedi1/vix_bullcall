@@ -60,7 +60,9 @@ from vix_spread.regime.broadcaster import broadcast_daily_to_minute  # noqa: E40
 from vix_spread.regime.hmm_spec import HMMSpec  # noqa: E402
 from vix_spread.regime.walk_forward import WalkForwardRegimeFitter  # noqa: E402
 from vix_spread.strategy.hypothesis import (  # noqa: E402
-    StrategyHypothesis, make_contrarian_tail_hypothesis,
+    StrategyHypothesis,
+    make_contrarian_tail_hypothesis,
+    make_high_vol_stress_test_hypothesis,
 )
 from vix_spread.strategy.sizing import FixedRiskSizer  # noqa: E402
 from vix_spread.strategy.spread_selector import SpreadSelector  # noqa: E402
@@ -489,6 +491,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--high-vol-stress", action="store_true",
+        help=(
+            "DIAGNOSTIC: use make_high_vol_stress_test_hypothesis() which "
+            "targets state_2 instead of state_0. Lets the FillEngine / "
+            "Sizer / reporting exercise on windows where every day is in "
+            "the high-vol regime (e.g., Mar-May 2026). NOT a backtest of "
+            "the contrarian_tail thesis."
+        ),
+    )
+    parser.add_argument(
         "--regime-diagnostic", action="store_true",
         help=(
             "Run the HMM regime diagnostic dump: refits the HMM at a "
@@ -675,6 +687,10 @@ def main() -> int:
             entry_regime_filter=lambda s: True,
             entry_curve_filter=lambda f: True,
             expected_holding_period=timedelta(days=21),
+        )
+    elif args.high_vol_stress:
+        hypothesis = make_high_vol_stress_test_hypothesis(
+            curve_feature_key="slope_m1_m2",
         )
     else:
         hypothesis = make_contrarian_tail_hypothesis(
