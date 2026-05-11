@@ -104,6 +104,8 @@ class WalkForwardBacktest:
         exit_decider: Callable[[OpenPosition, datetime], ExitPolicy | None],
         contract_id_for: Callable[[Product], str] | None = None,
         fill_mode: FillMode = FillMode.SYNTHETIC_BIDASK,
+        accept_midpoint_optimism: bool = False,
+        slippage_ticks_per_leg: int = 1,
     ) -> None:
         from vix_spread.data.vix_index_options import vix_option_active_contract_id
         if starting_equity <= 0:
@@ -120,6 +122,8 @@ class WalkForwardBacktest:
         self.exit_decider = exit_decider
         self.contract_id_for = contract_id_for or vix_option_active_contract_id
         self.fill_mode = fill_mode
+        self.accept_midpoint_optimism = accept_midpoint_optimism
+        self.slippage_ticks_per_leg = slippage_ticks_per_leg
 
     def run(self, minute_grid: Iterable[datetime]) -> BacktestResults:
         equity = self.starting_equity
@@ -205,6 +209,8 @@ class WalkForwardBacktest:
                 decision = self.strategy.evaluate(
                     market=market, signal=signal, as_of=T,
                     equity=equity, fill_mode=self.fill_mode,
+                    accept_midpoint_optimism=self.accept_midpoint_optimism,
+                    slippage_ticks_per_leg=self.slippage_ticks_per_leg,
                 )
                 decisions_log.append(decision)
                 if decision.action == "enter":
@@ -269,6 +275,8 @@ class WalkForwardBacktest:
             order_size=decision.size or 1,
             mode=self.fill_mode, gates=self.gates,
             decision_timestamp=decision.as_of,
+            accept_midpoint_optimism=self.accept_midpoint_optimism,
+            slippage_ticks_per_leg=self.slippage_ticks_per_leg,
         )
 
     @staticmethod

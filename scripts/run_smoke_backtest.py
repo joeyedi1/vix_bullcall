@@ -31,6 +31,10 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from vix_spread.backtest.reporting import (  # noqa: E402
+    format_three_scenario_summary,
+    run_three_scenarios,
+)
 from vix_spread.backtest.walk_forward import WalkForwardBacktest  # noqa: E402
 from vix_spread.data.feature_panel import FeaturePanel  # noqa: E402
 from vix_spread.data.processor import DataProcessor  # noqa: E402
@@ -305,6 +309,15 @@ def main() -> int:
             "even when the real regime/curve filter would gate everything."
         ),
     )
+    parser.add_argument(
+        "--three-scenario", action="store_true",
+        help=(
+            "Run the backtest THREE times — base (SYNTHETIC_BIDASK), "
+            "optimistic (MIDPOINT), stressed (SYNTHETIC_PLUS_SLIPPAGE) — "
+            "and emit a side-by-side comparison per ARCH §8.2. "
+            "~3x compute; data prep is shared across scenarios."
+        ),
+    )
     args = parser.parse_args()
 
     hypothesis_label = (
@@ -485,6 +498,35 @@ def main() -> int:
         exit_policy=ExitPolicy.FORCED_TUESDAY_LIQUIDATION,
     )
     exit_engine = ExitEngine(gates=gates)
+
+    if args.three_scenario:
+        # Per ARCH §8.2: rebuild the engine per scenario, sharing the
+        # heavy data prep (market_at / signal_at / exit_decider closures
+        # are already built and reused).
+        def factory(mode, accept_mid, slip):
+            return WalkForwardBacktest(
+                strategy=strategy,
+                fill_engine=fill_engine,
+                exit_engine=exit_engine,
+                gates=gates,
+                starting_equity=STARTING_EQUITY,
+                market_at=market_at,
+                signal_at=signal_at,
+                exit_decider=exit_decider,
+                fill_mode=mode,
+                accept_midpoint_optimism=accept_mid,
+                slippage_ticks_per_leg=slip,
+            )
+
+        print()
+        print("Running THREE-SCENARIO backtest ...", flush=True)
+        t0 = time.time()
+        bundle = run_three_scenarios(factory, minute_grid)
+        print(f"  done in {time.time() - t0:.1f}s")
+
+        print()
+        print(format_three_scenario_summary(bundle))
+        return 0
 
     backtest = WalkForwardBacktest(
         strategy=strategy,
